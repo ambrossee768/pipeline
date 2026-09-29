@@ -251,7 +251,7 @@ def _chapter_text(document: str) -> str:
 
 
 def build_bundle(epub: Path, output: Path, *, fallback: str | None = None,
-                 include_resources: bool = True) -> dict:
+                 include_resources: bool = True, include_all_documents: bool = False) -> dict:
     """Write chapter files and return the validated manifest.
 
     The output directory contains only files intended for a dataset commit.
@@ -279,12 +279,26 @@ def build_bundle(epub: Path, output: Path, *, fallback: str | None = None,
         for entry in toc_entries:
             if not _placeholder_title(entry["title"]):
                 toc_titles.setdefault(entry["source_path"], entry["title"])
-        for number, ref in enumerate((n for n in opf.iter() if _local_name(n) == "itemref"), 1):
-            item = manifest.get(ref.attrib.get("idref"))
-            if (not item or "nav" in item.get("properties", "").split()
-                    or item.get("media-type", "").lower() not in {"application/xhtml+xml", "text/html"}):
+        document_items = {
+            _zip_path(base, item.get("href", "")): item
+            for item in manifest.values()
+            if "nav" not in item.get("properties", "").split()
+            and item.get("media-type", "").lower() in {"application/xhtml+xml", "text/html"}
+        }
+        spine_paths = []
+        for ref in opf.iter():
+            if _local_name(ref) != "itemref":
                 continue
-            source_path = _zip_path(base, item.get("href", ""))
+            item = manifest.get(ref.attrib.get("idref"))
+            if not item or "nav" in item.get("properties", "").split():
+                continue
+            candidate = _zip_path(base, item.get("href", ""))
+            if candidate in document_items:
+                spine_paths.append(candidate)
+        document_paths = spine_paths + ([path for path in sorted(document_items) if path not in spine_paths]
+                                         if include_all_documents else [])
+        for number, source_path in enumerate(document_paths, 1):
+            item = document_items[source_path]
             if source_path not in names:
                 # Keep readable chapters when a broken package has one stale spine entry.
                 continue

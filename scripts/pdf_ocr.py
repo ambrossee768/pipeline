@@ -684,7 +684,7 @@ def build_item(item: dict, source: Path, bundle: Path) -> dict:
                 page_entry = dict(old_page)
                 if probe["classification"] != "native-text":
                     if not JXL_ENABLED:
-                        for field in ("j", "js", "jb"):
+                        for field in ("j", "jbucket", "js", "jb"):
                             page_entry.pop(field, None)
                     elif reencode_jxl:
                         with tempfile.TemporaryDirectory(dir=temp) as page_temp:
@@ -692,6 +692,7 @@ def build_item(item: dict, source: Path, bundle: Path) -> dict:
                             jxl_path = bundle / root / "pages" / f"page-{page:06d}.jxl"
                             jxl_sha, jxl_bytes = encode_jxl(rendered, jxl_path)
                             page_entry.update({"j": (root / "pages" / jxl_path.name).as_posix(),
+                                                "jbucket": shared.PDF_OCR_INPUT_BUCKET,
                                                "js": jxl_sha, "jb": jxl_bytes})
                 page_results.append(page_entry)
                 continue
@@ -745,10 +746,12 @@ def build_item(item: dict, source: Path, bundle: Path) -> dict:
                     jxl_path = bundle / root / "pages" / f"page-{page:06d}.jxl"
                     jxl_sha, jxl_bytes = encode_jxl(rendered, jxl_path)
                     page_entry.update({"j": (root / "pages" / jxl_path.name).as_posix(),
+                                       "jbucket": shared.PDF_OCR_INPUT_BUCKET,
                                        "js": jxl_sha, "jb": jxl_bytes})
             if input_png_path:
                 input_sha, input_bytes = shared.hash_file(input_png_path)
                 page_entry.update({"i": (root / "ocr-input" / input_png_path.name).as_posix(),
+                                   "ibucket": shared.PDF_OCR_INPUT_BUCKET,
                                    "is": input_sha, "ib": input_bytes})
             page_results.append(page_entry)
             for suffix in (".png", ".webp"):
@@ -772,6 +775,8 @@ def build_item(item: dict, source: Path, bundle: Path) -> dict:
     if image_pages and not reuse_previous:
         page_manifest = pdf_assets.compact_page_manifest(
             source_sha, asset_profile(), image_pages, manifest_dir=root,
+            ocr_pages=[{"page": entry["p"], "o": entry["o"], "os": entry["os"], "ob": entry["ob"]}
+                        for entry in page_results],
         )
         page_manifest_path = bundle / root / "page-manifest.json"
         page_manifest_sha, page_manifest_bytes = write_json(page_manifest_path, page_manifest)
@@ -873,7 +878,7 @@ def source_records(search_data: Path, revisions: Path, assets_manifest: dict | N
     # for it instead of indexing the known-bad source text.
     records = [item for item in records if not (
         item.get("source_kind") == "upstream"
-        and (item.get("repo"), item.get("path")) in reader_assets.KNOWN_GBK_PDFS
+        and reader_assets.known_gbk_pdf(item.get("repo"), item.get("path"))
     )]
     by_key = {}
     for item in records:
@@ -911,5 +916,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-            ocr_pages=[{"page": entry["p"], "o": entry["o"], "os": entry["os"], "ob": entry["ob"]}
-                        for entry in page_results],

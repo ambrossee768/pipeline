@@ -11,14 +11,26 @@ from pathlib import Path
 MANIFEST_VERSION = 1
 CHAPTER_MANIFEST_VERSION = 1
 READER_ASSETS_REPO = "vomebook/Reader-Assets"
+READER_ASSETS_BUCKET = "vomebook/pdf-pages"
+READER_STAGING_BUCKET = "vomebook/pdf-optimized"
 MANIFEST_NAME = "manifest.json"
 # Chapter manifests make multi-file books cheap to open: the Reader fetches the
 # manifest and nearby chapters instead of downloading the complete archive.
 # Native ebook chapter bundles include an on-demand full-text search index.
-EPUB_CHAPTER_SPLIT_BYTES = 8 * 1024 * 1024
 CHM_CHAPTER_SPLIT_BYTES = 16 * 1024 * 1024
 EPUB_CHAPTER_BUNDLE_DIR = "epub-chapters"
-EPUB_CHAPTER_PROFILE = "epub-chapters-v6"
+EPUB_CHAPTER_PROFILE = "epub-chapters-v8-bucket"
+BUCKET_NATIVE_EXTENSIONS = {
+    "txt": ("native-text-v1", "text", "document.txt"),
+    "md": ("native-markdown-v1", "markdown", "document.md"),
+    "markdown": ("native-markdown-v1", "markdown", "document.md"),
+    "jpg": ("native-image-webp-v1", "image", "document.webp"),
+    "jpeg": ("native-image-webp-v1", "image", "document.webp"),
+    "png": ("native-image-webp-v1", "image", "document.webp"),
+    "gif": ("native-image-webp-v1", "image", "document.webp"),
+    "bmp": ("native-image-webp-v1", "image", "document.webp"),
+    "webp": ("native-image-webp-v1", "image", "document.webp"),
+}
 CONVERTIBLE_EXTENSIONS = {
     "doc": ("libreoffice-docx-v2", "docx", "document.docx"),
     "docx": ("docx-native-v2", "docx", "document.docx"),
@@ -66,6 +78,16 @@ CONVERTIBLE_EXTENSIONS = {
 PROTECTED_PDF_CONTRACT = ("qpdf-decrypted-v1", "pdf", "document.pdf")
 GBK_PDF_CONTRACT = ("gbk-font-repair-v1", "pdf", "document.pdf")
 GBK_PDF_FOLDER = "A4 毛泽东主席/03-03 建国以来毛泽东文稿 林一章版"
+GBK_PDF_REPAIR_FOLDERS = (
+    "A1 马克思&恩格斯/01-04 马克思恩格斯全集 林一章新版",
+    "A1 马克思&恩格斯/02-05 马克思恩格斯选集 林一章版",
+    "A2 列宁/02-06 列宁选集 林一章版（博览网版）",
+    "A3 斯大林/01-04 斯大林全集 林一章旧版",
+    "A3 斯大林/02-01 斯大林选集 林一章旧版（博览网版）",
+    "A4 毛泽东主席/02-03 毛泽东选集 林一章版 第一版",
+    "A4 毛泽东主席/02-05 毛泽东选集 林一章版（博览网版）第二版",
+    "其他/鲁迅/鲁迅全集 林一章版",
+)
 KNOWN_GBK_PDFS = {
     ("VoiceOfML/Teachers", f"{GBK_PDF_FOLDER}/{name}.pdf")
     for name in (
@@ -77,6 +99,15 @@ KNOWN_GBK_PDFS = {
         "第11册 (1964.1-1965.12)",
     )
 }
+
+
+def known_gbk_pdf(repo: str, path: str) -> bool:
+    return (repo, path) in KNOWN_GBK_PDFS or (
+        repo == "VoiceOfML/Teachers" and isinstance(path, str) and path.lower().endswith(".pdf")
+        and any(path.startswith(folder + "/") for folder in GBK_PDF_REPAIR_FOLDERS)
+    )
+
+
 PASSWORD_RE = re.compile(
     r"(?:密码|口令|password|passwd)\s*(?:[：:=]\s*|(?=[A-Za-z0-9]))"
     r"([^\s\]〕】）)},，；;]+)",
@@ -95,11 +126,11 @@ def conversion_contract(extension: str, key: str = "") -> tuple[str, str, str]:
 
 
 def needs_epub_chapters(extension: str, reader_mode: str, source_bytes: int) -> bool:
-    """Whether a large book should receive an independently fetched chapter bundle."""
+    """All supported native ebook formats use the independently fetched chapter stream."""
     # CHM navigation includes groups and repeated fragment targets. The flat
     # chapter bundle cannot represent that tree; keep its repaired native EPUB.
-    return (extension in {"epub", "mobi", "azw3", "fb2"} and reader_mode == "foliate"
-            and int(source_bytes or 0) >= EPUB_CHAPTER_SPLIT_BYTES)
+    return ((extension in {"epub", "mobi", "azw3", "fb2"} and reader_mode == "foliate")
+            or (extension == "chm" and reader_mode == "epub"))
 
 
 def source_password(repo: str, path: str) -> str:
@@ -131,6 +162,15 @@ def validate_object_path(path: str) -> str:
             or path.startswith("/") or any(part in {"", ".", ".."} for part in path.split("/"))):
         raise ValueError("invalid reader asset object path")
     return path
+
+
+def validate_storage_path(path: str) -> str:
+    """Validate either a final immutable object or a lifecycle staging object."""
+    if isinstance(path, str) and path.startswith("staging/"):
+        if "\\" in path or path.startswith("/") or any(part in {"", ".", ".."} for part in path.split("/")):
+            raise ValueError("invalid reader staging path")
+        return path
+    return validate_object_path(path)
 
 
 def validate_chapter_manifest(manifest: dict) -> dict:
@@ -182,11 +222,37 @@ def validate_chapter_manifest(manifest: dict) -> dict:
 def source_conversion_contract(repo: str, path: str, extension: str, source_bytes: int = 0):
     if extension in CONVERTIBLE_EXTENSIONS:
         return CONVERTIBLE_EXTENSIONS[extension]
-    if extension == "pdf" and (repo, path) in KNOWN_GBK_PDFS:
+    if extension == "pdf" and known_gbk_pdf(repo, path):
         return GBK_PDF_CONTRACT
     if extension == "pdf" and source_password(repo, path):
         return PROTECTED_PDF_CONTRACT
     return None
+
+
+def bucket_conversion_contract(repo: str, path: str, extension: str, source_bytes: int = 0):
+    """Return the contract used when moving every static Reader format to the bucket."""
+    if extension == "pdf":
+        # Every PDF is staged in pdf-pages until the page-stream pipeline
+        # consumes it. Structure optimization is retired.
+        special = source_conversion_contract(repo, path, extension, source_bytes)
+        if special:
+            return special
+        return ("pdf-staging-v1", "pdf", "document.pdf")
+    if extension in BUCKET_NATIVE_EXTENSIONS:
+        return BUCKET_NATIVE_EXTENSIONS[extension]
+    contract = source_conversion_contract(repo, path, extension, source_bytes)
+    if contract and contract[1] in {"docx", "html", "text", "markdown", "image", "pdf", "foliate", "epub"}:
+        return contract
+    return None
+
+
+def conversion_dependencies(extension: str, reader_mode: str) -> dict:
+    """Describe local-only conversion inputs that never become bucket objects."""
+    if extension == "chm":
+        return {"kind": "chm-expanded-html", "lifetime": "runner", "final_mode": reader_mode}
+    if extension in {"mobi", "azw3", "fb2"} and reader_mode == "foliate":
+        return {"kind": "temporary-epub", "lifetime": "runner", "final_mode": reader_mode}
+    return {"kind": "none", "lifetime": "none", "final_mode": reader_mode}
 
 
 def empty_manifest() -> dict:
@@ -207,15 +273,17 @@ def validate_manifest(manifest: dict) -> dict:
         if status not in {"ready", "failed"}:
             raise ValueError("reader manifest file entry has invalid status")
         if status == "ready":
-            validate_object_path(entry.get("path"))
+            validate_storage_path(entry.get("path"))
             for field in ("chapter_manifest", "fallback_path"):
                 if field in entry:
                     validate_object_path(entry[field])
+            if entry.get("chapter_bucket") not in {None, "vomebook/pdf-pages"}:
+                raise ValueError("invalid chapter bucket")
             if "chapter_manifest" in entry and not entry["chapter_manifest"].endswith("/chapter-manifest.json"):
                 raise ValueError("invalid chapter manifest path")
             if "chapter_manifest" in entry and entry.get("reader_mode") not in {"epub", "foliate", "pdf"}:
                 raise ValueError("chapter manifest requires EPUB or PDF reader mode")
-            if "reader_mode" in entry and entry.get("reader_mode") not in {"pdf", "epub", "foliate", "docx", "html", "audio", "video"}:
+            if "reader_mode" in entry and entry.get("reader_mode") not in {"pdf", "epub", "foliate", "docx", "html", "text", "markdown", "image", "audio", "video"}:
                 raise ValueError("reader manifest ready entry has invalid reader mode")
             if "bytes" in entry and (not isinstance(entry.get("bytes"), int) or entry["bytes"] <= 0):
                 raise ValueError("reader manifest ready entry has invalid byte count")
