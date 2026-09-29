@@ -911,3 +911,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+            ocr_pages=[{"page": entry["p"], "o": entry["o"], "os": entry["os"], "ob": entry["ob"]}
+                        for entry in page_results],
