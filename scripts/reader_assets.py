@@ -19,7 +19,10 @@ MANIFEST_NAME = "manifest.json"
 CHM_CHAPTER_SPLIT_BYTES = 16 * 1024 * 1024
 EPUB_CHAPTER_BUNDLE_DIR = "epub-chapters"
 EPUB_CHAPTER_PROFILE = "epub-chapters-v8-bucket"
-SPREADSHEET_PAGE_PROFILE = "libreoffice-html-pages-spreadsheet-v5"
+SPREADSHEET_HTML_PROFILE = "libreoffice-native-html-spreadsheet-v1"
+# Retained for validation of already-published image-stream manifests.
+SPREADSHEET_PAGE_PROFILE = "libreoffice-html-pages-spreadsheet-v6"
+SPREADSHEET_EXTENSIONS = frozenset({"xls", "xlsx", "csv", "ods"})
 NATIVE_MEDIA_PROFILE = "native-media-cdn-v1"
 BUCKET_NATIVE_MEDIA_EXTENSIONS = {
     **{extension: (NATIVE_MEDIA_PROFILE, "audio", f"audio.{extension}") for extension in (
@@ -36,9 +39,10 @@ BUCKET_NATIVE_EXTENSIONS = {
     "jpg": ("native-image-webp-v1", "image", "document.webp"),
     "jpeg": ("native-image-webp-v1", "image", "document.webp"),
     "png": ("native-image-webp-v1", "image", "document.webp"),
-    "gif": ("native-image-webp-v1", "image", "document.webp"),
     "bmp": ("native-image-webp-v1", "image", "document.webp"),
     "webp": ("native-image-webp-v1", "image", "document.webp"),
+    "vcf": ("native-text-v1", "text", "document.txt"),
+    "ini": ("native-text-v1", "text", "document.txt"),
 }
 CONVERTIBLE_EXTENSIONS = {
     "doc": ("libreoffice-docx-v2", "docx", "document.docx"),
@@ -268,10 +272,10 @@ def bucket_conversion_contract(repo: str, path: str, extension: str, source_byte
         return BUCKET_NATIVE_EXTENSIONS[extension]
     if extension in BUCKET_NATIVE_MEDIA_EXTENSIONS:
         return BUCKET_NATIVE_MEDIA_EXTENSIONS[extension]
-    if extension in {"xls", "xlsx"}:
-        return (SPREADSHEET_PAGE_PROFILE, "pdf", "page-manifest.json")
+    if extension in {"xls", "xlsx", "csv", "ods"}:
+        return (SPREADSHEET_HTML_PROFILE, "html", "document.html")
     contract = source_conversion_contract(repo, path, extension, source_bytes)
-    if contract and contract[1] in {"docx", "html", "text", "markdown", "image", "pdf", "foliate", "epub", "audio", "video", "swf"}:
+    if contract and contract[1] in {"docx", "html", "text", "markdown", "image", "pdf", "foliate", "epub", "swf"}:
         return contract
     return None
 
@@ -287,41 +291,6 @@ def conversion_dependencies(extension: str, reader_mode: str) -> dict:
 
 def empty_manifest() -> dict:
     return {"version": MANIFEST_VERSION, "files": {}}
-
-
-def restore_bucket_media_mappings(manifest: dict, lifecycle: dict) -> dict:
-    """Recover finalized media mappings from the durable bucket lifecycle index."""
-    files = manifest.setdefault("files", {})
-    for key, record in lifecycle.get("files", {}).items():
-        current = files.get(key, {})
-        if record.get("phase") != "final" or current.get("bucket") == READER_ASSETS_BUCKET:
-            continue
-        profile = str(record.get("profile") or "")
-        path = str(record.get("path") or "")
-        if profile == NATIVE_MEDIA_PROFILE:
-            mode = "audio" if Path(path).name.startswith("audio.") else "video"
-        elif profile.startswith("native-swf-"):
-            mode = "swf"
-        elif profile.startswith("ffmpeg-audio-"):
-            mode = "audio"
-        elif profile.startswith("ffmpeg-video-"):
-            mode = "video"
-        else:
-            continue
-        files[key] = {
-            **current,
-            "status": "ready",
-            "source_revision": record.get("source_revision", ""),
-            "source_sha256": record.get("source_sha256", ""),
-            "source_extension": key.rsplit(".", 1)[-1].lower(),
-            "profile": profile,
-            "reader_mode": mode,
-            "path": path,
-            "bytes": record.get("bytes"),
-            "sha256": record.get("sha256"),
-            "bucket": READER_ASSETS_BUCKET,
-        }
-    return manifest
 
 
 def validate_manifest(manifest: dict) -> dict:

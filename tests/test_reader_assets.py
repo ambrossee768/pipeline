@@ -22,10 +22,51 @@ from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 
 from scripts import build_reader_assets_index, convert_reader_assets, pdf_assets, publish_reader_assets
 from scripts import gc_reader_bucket, prune_reader_assets, publish_search_reader_index
-from scripts import epub_chapters, reader_assets, scan_reader_assets
+from scripts import epub_chapters, reader_assets, render_spreadsheet_html, scan_reader_assets
 
 
 class ReaderAssetContractTests(unittest.TestCase):
+    def test_bucket_head_inventory_treats_only_not_found_as_missing(self):
+        store = gc_reader_bucket.S3BucketStore.__new__(gc_reader_bucket.S3BucketStore)
+        store._location = Mock(return_value=("vomebook", "pdf-pages"))
+        client = Mock()
+
+        class MissingObject(Exception):
+            response = {"Error": {"Code": "404"}, "ResponseMetadata": {"HTTPStatusCode": 404}}
+
+        def head_object(*, Key, **_kwargs):
+            if Key == "objects/missing":
+                raise MissingObject()
+
+        client.head_object.side_effect = head_object
+        store._client = Mock(return_value=client)
+        store._list_workers = 2
+        store._verify_workers = 2
+        self.assertEqual(store.existing_files(
+            reader_assets.READER_ASSETS_BUCKET, {"objects/present", "objects/missing"},
+        ), {"objects/present"})
+
+    def test_bucket_integrity_scan_expands_page_and_chapter_manifests(self):
+        store = gc_reader_bucket.S3BucketStore.__new__(gc_reader_bucket.S3BucketStore)
+        store._manifest_workers = 2
+        manifests = {
+            "objects/a/page-manifest.json": {"page_count": 2},
+            "ebook-chapters/objects/b/chapter-manifest.json": {
+                "chapters": [{"path": "chapters/chapter-0001.xhtml"}],
+                "search_index": {"path": "epub-search-index.json.gz"},
+            },
+        }
+        store.read_bytes = Mock(side_effect=lambda _bucket, path: json.dumps(manifests[path]).encode())
+        self.assertEqual(store.manifest_references(reader_assets.READER_ASSETS_BUCKET, set(manifests)), {
+            "objects/a/page-manifest.json": {
+                "objects/a/pages/page-000001.webp", "objects/a/pages/page-000002.webp",
+            },
+            "ebook-chapters/objects/b/chapter-manifest.json": {
+                "ebook-chapters/objects/b/chapters/chapter-0001.xhtml",
+                "ebook-chapters/objects/b/epub-search-index.json.gz",
+            },
+        })
+
     def test_bucket_gc_zero_limit_means_unlimited(self):
         self.assertEqual(gc_reader_bucket.apply_limit(["b", "a", "c"], 0), ["a", "b", "c"])
         self.assertEqual(gc_reader_bucket.apply_limit(["b", "a", "c"], 2), ["a", "b"])
@@ -71,11 +112,13 @@ class ReaderAssetContractTests(unittest.TestCase):
             manifest,
             "ebook-chapters/objects/ab/book/epub-chapters/chapters/chapter-0001.xhtml",
             "ebook-chapters/objects/ab/book/epub-chapters/epub-search-index.json.gz",
+            "ebook-chapters/objects/ab/book/epub-chapters/resources/chapter-0001/cover.jpg",
         }
         references = {manifest}
         gc_reader_bucket.expand_reference_closure(store, files, references)
         self.assertIn("ebook-chapters/objects/ab/book/epub-chapters/chapters/chapter-0001.xhtml", references)
         self.assertIn("ebook-chapters/objects/ab/book/epub-chapters/epub-search-index.json.gz", references)
+        self.assertIn("ebook-chapters/objects/ab/book/epub-chapters/resources/chapter-0001/cover.jpg", references)
 
     def test_bucket_gc_jxl_only_filters_candidates_without_touching_other_assets(self):
         store = Mock()
@@ -142,10 +185,10 @@ class ReaderAssetContractTests(unittest.TestCase):
             set(reader_assets.CONVERTIBLE_EXTENSIONS),
             {"doc", "docx", "epub", "htm", "html", "mobi", "azw3", "fb2", "odt", "rtf", "chm", "tif", "tiff", "djvu",
              "ppt", "pptx", "pps", "odp", "xls", "xlsx", "csv", "ods", "wps", "mht", "mhtml", "ps", "caj", "kdh",
-             "ape", "wma", "amr", "flv", "f4v", "rm", "rmvb", "mkv", "avi", "mpg",
-             "mpeg", "mts", "ts", "wmv"},
+             "ape", "wma", "amr", "flac", "m4a", "mpga", "wav", "asx", "swf", "flv", "f4v", "rm", "rmvb", "mkv", "avi", "mpg",
+             "mpeg", "mts", "ts", "wmv", "mov", "mp4"},
         )
-        for extension in ("pdg", "swf", "asx", "dat", "mp3", "mp4", "wav", "m4a", "flac", "mov", "mpga"):
+        for extension in ("pdg", "dat", "mp3"):
             self.assertNotIn(extension, reader_assets.CONVERTIBLE_EXTENSIONS)
 
     def test_source_url_pins_revision_and_encodes_path(self):
@@ -188,6 +231,8 @@ class ReaderAssetContractTests(unittest.TestCase):
             "ape": ("ffmpeg-audio-mp3-v1", "audio", "audio.mp3"),
             "wma": ("ffmpeg-audio-mp3-v1", "audio", "audio.mp3"),
             "amr": ("ffmpeg-audio-mp3-v1", "audio", "audio.mp3"),
+            "asx": ("ffmpeg-media-auto-v1", "video", "video.mp4"),
+            "swf": ("native-swf-ruffle-v1", "swf", "document.swf"),
             **{extension: ("ffmpeg-video-mp4-h264-aac-v1", "video", "video.mp4") for extension in (
                 "flv", "f4v", "rm", "rmvb", "mkv", "avi", "mpg", "mpeg", "mts", "ts", "wmv",
             )},
@@ -195,8 +240,27 @@ class ReaderAssetContractTests(unittest.TestCase):
         self.assertEqual({ext: reader_assets.conversion_contract(ext) for ext in expected}, expected)
         self.assertEqual(
             reader_assets.bucket_conversion_contract("repo", "table.xlsx", "xlsx"),
-            (reader_assets.SPREADSHEET_PAGE_PROFILE, "pdf", "page-manifest.json"),
+            (reader_assets.SPREADSHEET_HTML_PROFILE, "html", "document.html"),
         )
+        self.assertEqual(
+            reader_assets.bucket_conversion_contract("repo", "animation.swf", "swf"),
+            ("native-swf-ruffle-v1", "swf", "document.swf"),
+        )
+        for extension, mode, output in (
+            ("mp3", "audio", "audio.mp3"), ("wav", "audio", "audio.wav"),
+            ("m4a", "audio", "audio.m4a"), ("flac", "audio", "audio.flac"),
+            ("mpga", "audio", "audio.mpga"), ("mp4", "video", "video.mp4"),
+            ("mov", "video", "video.mov"),
+        ):
+            self.assertEqual(
+                reader_assets.bucket_conversion_contract("repo", f"media.{extension}", extension),
+                (reader_assets.NATIVE_MEDIA_PROFILE, mode, output),
+            )
+        for extension in ("xls", "xlsx", "csv", "ods"):
+            self.assertEqual(
+                reader_assets.bucket_conversion_contract("repo", f"table.{extension}", extension),
+                (reader_assets.SPREADSHEET_HTML_PROFILE, "html", "document.html"),
+            )
 
     def test_large_docx_keeps_native_contract(self):
         self.assertEqual(
@@ -282,29 +346,6 @@ class ReaderAssetContractTests(unittest.TestCase):
     def test_manifest_rejects_invalid_file_status(self):
         with self.assertRaisesRegex(ValueError, "invalid status"):
             reader_assets.validate_manifest({"version": 1, "files": {"key": {"status": "pending"}}})
-
-    def test_lifecycle_restores_final_media_mappings(self):
-        manifest = reader_assets.empty_manifest()
-        lifecycle = {"files": {
-            "VoiceOfML/Test\\0audio.flac": {
-                "phase": "final", "profile": "native-media-cdn-v1",
-                "path": "objects/aa/native-media-cdn-v1/audio.flac", "bytes": 12,
-                "sha256": "a" * 64, "source_sha256": "b" * 64, "source_revision": "rev",
-            },
-            "VoiceOfML/Test\\0flash.swf": {
-                "phase": "final", "profile": "native-swf-ruffle-v1",
-                "path": "objects/bb/native-swf-ruffle-v1/document.swf", "bytes": 13,
-                "sha256": "c" * 64, "source_sha256": "d" * 64, "source_revision": "rev",
-            },
-            "VoiceOfML/Test\\0pending.wav": {
-                "phase": "uploading", "profile": "native-media-cdn-v1",
-                "path": "objects/cc/audio.wav", "bytes": 1, "sha256": "e" * 64,
-            },
-        }}
-        reader_assets.restore_bucket_media_mappings(manifest, lifecycle)
-        self.assertEqual(manifest["files"]["VoiceOfML/Test\\0audio.flac"]["reader_mode"], "audio")
-        self.assertEqual(manifest["files"]["VoiceOfML/Test\\0flash.swf"]["reader_mode"], "swf")
-        self.assertNotIn("VoiceOfML/Test\\0pending.wav", manifest["files"])
 
     def test_only_known_password_pdfs_have_a_conversion_contract(self):
         self.assertEqual(
@@ -485,7 +526,7 @@ class ScannerTests(unittest.TestCase):
               ("txt", "text", "document.txt"), ("mht", "html", "document.html")],
         )
 
-    def test_bucket_migration_queues_xlsx_as_a_page_stream(self):
+    def test_bucket_migration_queues_xlsx_as_native_html(self):
         record = {"Repo": "VoiceOfML/Test", "File": "Table", "Extension": "xlsx",
                   "Folder": [], "Size": 100}
         queue = scan_reader_assets.build_queue(
@@ -493,8 +534,60 @@ class ScannerTests(unittest.TestCase):
             bucket_migrate=True,
         )
         self.assertEqual(len(queue), 1)
-        self.assertEqual(queue[0]["reader_mode"], "pdf")
-        self.assertTrue(queue[0]["page_stream"])
+        self.assertEqual(queue[0]["reader_mode"], "html")
+        self.assertEqual(queue[0]["profile"], reader_assets.SPREADSHEET_HTML_PROFILE)
+        self.assertEqual(queue[0]["output_name"], "document.html")
+        self.assertNotIn("page_stream", queue[0])
+
+    def test_bucket_migration_leaves_pdfs_to_the_dedicated_page_pipeline(self):
+        records = [{"Repo": "VoiceOfML/Test", "File": "Book", "Extension": "pdf",
+                    "Folder": [], "Size": 100}]
+        self.assertEqual(scan_reader_assets.build_queue(
+            records, self.revisions, reader_assets.empty_manifest(), bucket_migrate=True,
+        ), [])
+
+    def test_bucket_migration_queues_csv_as_native_html(self):
+        record = {"Repo": "VoiceOfML/Test", "File": "Data", "Extension": "csv",
+                  "Folder": [], "Size": 100}
+        queue = scan_reader_assets.build_queue(
+            [record], self.revisions, reader_assets.empty_manifest(), bucket_migrate=True,
+        )
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["profile"], reader_assets.SPREADSHEET_HTML_PROFILE)
+        self.assertEqual(queue[0]["reader_mode"], "html")
+        self.assertEqual(queue[0]["output_name"], "document.html")
+        self.assertNotIn("page_stream", queue[0])
+
+    def test_bucket_migration_queues_native_media_and_keeps_conversion_fallback(self):
+        record = {"Repo": "VoiceOfML/Test", "File": "concert", "Extension": "mp4",
+                  "Folder": [], "Size": 100}
+        queue = scan_reader_assets.build_queue(
+            [record], self.revisions, reader_assets.empty_manifest(), bucket_migrate=True,
+        )
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["profile"], reader_assets.NATIVE_MEDIA_PROFILE)
+        self.assertEqual(queue[0]["output_name"], "video.mp4")
+        self.assertEqual(
+            reader_assets.source_conversion_contract(record["Repo"], "concert.mp4", "mp4"),
+            reader_assets.conversion_contract("mp4"),
+        )
+        self.assertIn(
+            reader_assets.asset_key(record["Repo"], "concert.mp4"),
+            scan_reader_assets.active_keys([record], bucket_migrate=True),
+        )
+
+    def test_native_media_bucket_mapping_is_published_in_reader_sidecar(self):
+        path = "objects/aa/" + "a" * 64 + "/native-media-cdn-v1/audio.flac"
+        entry = {
+            "status": "ready", "reader_mode": "audio", "source_extension": "flac",
+            "path": path, "bucket": reader_assets.READER_ASSETS_BUCKET,
+        }
+        sidecar = build_reader_assets_index.build_index({
+            "version": 1, "files": {"VoiceOfML/Test\0audio.flac": entry},
+        })
+        self.assertEqual(sidecar["f"]["VoiceOfML/Test\0audio.flac"], {
+            "s": 2, "m": "a", "p": path, "b": reader_assets.READER_ASSETS_BUCKET,
+        })
 
     def test_bucket_migration_skips_an_asset_already_in_shared_bucket(self):
         key = reader_assets.asset_key("VoiceOfML/Test", "A/Book.docx")
@@ -504,6 +597,80 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(scan_reader_assets.build_queue(
             self.records[:1], self.revisions, manifest, bucket_migrate=True,
         ), [])
+
+    def test_bucket_migration_replaces_legacy_spreadsheet_page_stream_with_pdf(self):
+        record = {"Repo": "VoiceOfML/Test", "File": "Table", "Extension": "xlsx",
+                  "Folder": [], "Size": 100}
+        key = reader_assets.asset_key(record["Repo"], "Table.xlsx")
+        old_path = "objects/aa/" + "a" * 64 + "/1234567890abcdef/page-manifest.json"
+        manifest = {"version": 1, "files": {key: {
+            "status": "ready", "profile": reader_assets.SPREADSHEET_PAGE_PROFILE,
+            "reader_mode": "pdf", "source_extension": "xlsx",
+            "bucket": reader_assets.READER_ASSETS_BUCKET, "path": old_path,
+        }}}
+        queue = scan_reader_assets.build_queue(
+            [record], self.revisions, manifest, bucket_migrate=True,
+            bucket_objects={old_path},
+        )
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["profile"], reader_assets.SPREADSHEET_HTML_PROFILE)
+        self.assertEqual(queue[0]["reader_mode"], "html")
+        self.assertEqual(queue[0]["output_name"], "document.html")
+
+    def test_bucket_migration_requeues_ready_mapping_when_bucket_object_is_missing(self):
+        key = reader_assets.asset_key("VoiceOfML/Test", "A/Book.docx")
+        manifest = {"version": 1, "files": {key: {
+            "status": "ready", "profile": "docx-native-v2",
+            "bucket": reader_assets.READER_ASSETS_BUCKET,
+            "path": "objects/missing/document.docx",
+        }}}
+        queue = scan_reader_assets.build_queue(
+            self.records[:1], self.revisions, manifest, bucket_migrate=True,
+            bucket_objects={"objects/other/document.docx"},
+        )
+        self.assertEqual([item["key"] for item in queue], [key])
+
+    def test_bucket_migration_skips_ready_mapping_when_bucket_object_exists(self):
+        key = reader_assets.asset_key("VoiceOfML/Test", "A/Book.docx")
+        manifest = {"version": 1, "files": {key: {
+            "status": "ready", "profile": "docx-native-v2",
+            "bucket": reader_assets.READER_ASSETS_BUCKET,
+            "path": "objects/present/document.docx",
+        }}}
+        self.assertEqual(scan_reader_assets.build_queue(
+            self.records[:1], self.revisions, manifest, bucket_migrate=True,
+            bucket_objects={"objects/present/document.docx"},
+        ), [])
+
+    def test_bucket_migration_requeues_missing_chapter_manifest(self):
+        record = {"Repo": "VoiceOfML/Test", "File": "Book", "Extension": "epub",
+                  "Folder": [], "Size": 100}
+        key = reader_assets.asset_key(record["Repo"], "Book.epub")
+        manifest = {"version": 1, "files": {key: {
+            "status": "ready", "profile": "foliate-original-v1", "reader_mode": "foliate",
+            "bucket": reader_assets.READER_ASSETS_BUCKET,
+            "path": "objects/present/document.epub",
+            "chapter_manifest": "ebook-chapters/objects/missing/chapter-manifest.json",
+            "chapter_bucket": reader_assets.READER_ASSETS_BUCKET,
+        }}}
+        queue = scan_reader_assets.build_queue(
+            [record], self.revisions, manifest, bucket_migrate=True,
+            bucket_objects={"objects/present/document.epub"},
+        )
+        self.assertEqual([item["key"] for item in queue], [key])
+
+    def test_bucket_paths_to_check_only_selects_current_ready_bucket_mappings(self):
+        key = reader_assets.asset_key("VoiceOfML/Test", "A/Book.docx")
+        stale_key = reader_assets.asset_key("VoiceOfML/Test", "Deleted.docx")
+        manifest = {"version": 1, "files": {
+            key: {"status": "ready", "bucket": reader_assets.READER_ASSETS_BUCKET,
+                  "path": "objects/a/document.docx"},
+            stale_key: {"status": "ready", "bucket": reader_assets.READER_ASSETS_BUCKET,
+                       "path": "objects/stale/document.docx"},
+        }}
+        self.assertEqual(scan_reader_assets.bucket_paths_to_check(
+            self.records[:1], manifest,
+        ), {"objects/a/document.docx"})
 
     def test_bucket_migration_force_requeues_an_asset_already_marked_in_bucket(self):
         key = reader_assets.asset_key("VoiceOfML/Test", "A/Book.docx")
@@ -712,6 +879,12 @@ class ScannerTests(unittest.TestCase):
         api.file_exists.side_effect = RepositoryNotFoundError("missing", response=response)
         self.assertEqual(scan_reader_assets.remote_manifest(api, "vomebook/Missing"), reader_assets.empty_manifest())
 
+    def test_bucket_manifest_failure_does_not_fall_back_to_stale_dataset_manifest(self):
+        api = type("HfApi", (), {})()
+        with patch.object(scan_reader_assets, "read_bucket_json", side_effect=OSError("temporary bucket failure")), \
+                self.assertRaisesRegex(RuntimeError, "stale dataset manifest"):
+            scan_reader_assets.remote_manifest(api, "vomebook/Reader-Assets")
+
     def test_reusable_objects_include_ready_files_and_orphans(self):
         manifest = {"version": 1, "files": {
             "book": {"status": "ready", "source_sha256": "a" * 64, "profile": "p1",
@@ -867,19 +1040,47 @@ class ConverterTests(unittest.TestCase):
             self.assertEqual(command[0:6], ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"])
             self.assertIn("libmp3lame", command)
             self.assertIn("0:a:0", command)
-            self.assertEqual(command[-3:], ["-f", "mp3", str(target)])
             self.assertEqual(run.call_args.kwargs["timeout_seconds"], convert_reader_assets.MEDIA_COMMAND_TIMEOUT_SECONDS)
 
-    def test_native_wav_validation_accepts_pcm_container(self):
-        probe = {
-            "streams": [{"codec_type": "audio", "codec_name": "pcm_s16le"}],
-            "format": {"duration": "12", "format_name": "wav"},
-        }
+    def test_native_audio_keeps_compatible_source_bytes(self):
         with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / "audio.wav"
-            path.write_bytes(b"wav")
-            with patch.object(convert_reader_assets, "media_probe", return_value=probe):
-                convert_reader_assets.validate_output(path, "audio", native_media=True)
+            work = Path(root)
+            source, target = work / "source.flac", work / "audio.flac"
+            source.write_bytes(b"lossless source")
+            with patch.object(convert_reader_assets, "run_checked") as run:
+                convert_reader_assets.convert_file(
+                    {"extension": "flac", "profile": reader_assets.NATIVE_MEDIA_PROFILE},
+                    source, target, work,
+                )
+            run.assert_not_called()
+            self.assertEqual(target.read_bytes(), source.read_bytes())
+
+    def test_native_mp4_with_unsupported_codec_selects_transcode_profile(self):
+        probe = {
+            "streams": [
+                {"codec_type": "video", "codec_name": "hevc", "pix_fmt": "yuv420p"},
+                {"codec_type": "audio", "codec_name": "aac"},
+            ],
+            "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+        }
+        item = {"extension": "mp4", "reader_mode": "video", "profile": reader_assets.NATIVE_MEDIA_PROFILE,
+                "output_name": "video.mp4"}
+        with tempfile.TemporaryDirectory() as root, patch.object(convert_reader_assets, "media_probe", return_value=probe):
+            converted = convert_reader_assets.prepare_native_media_item(item, Path(root) / "source.mp4")
+        self.assertEqual(converted["profile"], "ffmpeg-video-mp4-h264-aac-v1")
+        self.assertEqual(converted["output_name"], "video.mp4")
+        self.assertTrue(converted["transcode_media"])
+
+    def test_native_h264_mp4_preserves_bytes_without_transcoding(self):
+        probe = {
+            "streams": [
+                {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p", "width": 1280, "height": 720},
+                {"codec_type": "audio", "codec_name": "aac"},
+            ],
+            "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+        }
+        with tempfile.TemporaryDirectory() as root, patch.object(convert_reader_assets, "media_probe", return_value=probe):
+            self.assertTrue(convert_reader_assets.browser_native_media(Path("source.mp4"), "mp4", "video"))
 
     def test_video_conversion_uses_h264_aac_faststart_contract(self):
         with tempfile.TemporaryDirectory() as root:
@@ -892,6 +1093,7 @@ class ConverterTests(unittest.TestCase):
             for value in ("libx264", "yuv420p", "aac", "+faststart", "0:v:0", "0:a:0?"):
                 self.assertIn(value, command)
             self.assertEqual(run.call_args.kwargs["timeout_seconds"], convert_reader_assets.MEDIA_COMMAND_TIMEOUT_SECONDS)
+
 
     def test_audio_only_rm_uses_black_video_and_aac_audio(self):
         with tempfile.TemporaryDirectory() as root:
@@ -920,6 +1122,53 @@ class ConverterTests(unittest.TestCase):
             self.assertEqual(target.read_bytes()[:4], b"RIFF")
             with convert_reader_assets.Image.open(target) as image:
                 self.assertEqual(image.format, "WEBP")
+
+    def test_native_psd_conversion_outputs_webp(self):
+        with tempfile.TemporaryDirectory() as root:
+            work = Path(root)
+            source, target = work / "source.psd", work / "document.webp"
+            source.write_bytes(b"PSD")
+            with patch.object(convert_reader_assets.Image, "open",
+                               return_value=convert_reader_assets.Image.new("RGB", (4, 4), "red")):
+                convert_reader_assets.convert_file(
+                    {"extension": "psd", "reader_mode": "image", "output_name": "document.webp"},
+                    source, target, work,
+                )
+            with convert_reader_assets.Image.open(target) as image:
+                self.assertEqual(image.format, "WEBP")
+
+    def test_native_vcf_and_ini_conversion_copies_text(self):
+        with tempfile.TemporaryDirectory() as root:
+            work = Path(root)
+            for extension, content in (("vcf", b"BEGIN:VCARD\nEND:VCARD\n"), ("ini", b"[section]\nkey=value\n")):
+                with self.subTest(extension=extension):
+                    source, target = work / f"source.{extension}", work / "document.txt"
+                    source.write_bytes(content)
+                    convert_reader_assets.convert_file(
+                        {"extension": extension, "reader_mode": "text", "output_name": "document.txt"},
+                        source, target, work,
+                    )
+                    self.assertEqual(target.read_bytes(), content)
+
+    def test_image_conversion_downscales_webp_unsupported_edge(self):
+        with tempfile.TemporaryDirectory() as root:
+            work = Path(root)
+            source, target = work / "source.png", work / "document.webp"
+            convert_reader_assets.Image.new("RGB", (16_384, 1), "white").save(source)
+            convert_reader_assets.convert_reader_image(source, target)
+            with convert_reader_assets.Image.open(target) as image:
+                self.assertEqual(image.format, "WEBP")
+                self.assertLessEqual(max(image.size), convert_reader_assets.MAX_READER_IMAGE_EDGE)
+
+    def test_large_image_conversion_restores_pillow_pixel_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            work = Path(root)
+            source, target = work / "source.png", work / "document.webp"
+            convert_reader_assets.Image.new("RGB", (4, 4), "white").save(source)
+            with patch.object(convert_reader_assets.Image, "MAX_IMAGE_PIXELS", 10):
+                convert_reader_assets.convert_reader_image(source, target)
+                self.assertEqual(convert_reader_assets.Image.MAX_IMAGE_PIXELS, 10)
+            self.assertTrue(target.is_file())
 
     def test_calibre_office_book_conversion_uses_html_output(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1033,24 +1282,25 @@ class ConverterTests(unittest.TestCase):
     def test_encrypted_ole_xlsx_without_password_fails_before_libreoffice(self):
         with tempfile.TemporaryDirectory() as root:
             work = Path(root)
-            source, target = work / "source.xlsx", work / "page-manifest.json"
+            source, target = work / "source.xlsx", work / "document.html"
             source.write_bytes(convert_reader_assets.OLE_SIGNATURE + b"encrypted")
             office = Mock()
             office.is_encrypted.return_value = True
             with patch.dict(convert_reader_assets.os.environ, {"READER_CONVERSION_PASSWORD": ""}), \
                     patch.dict("sys.modules", {"msoffcrypto": Mock(OfficeFile=Mock(return_value=office))}), \
-                    patch.object(convert_reader_assets, "convert_spreadsheet_to_pages") as convert:
+                    patch.object(convert_reader_assets, "convert_spreadsheet_to_html") as convert:
                 with self.assertRaisesRegex(RuntimeError, "encrypted spreadsheet requires"):
                     convert_reader_assets.convert_file(
-                        {"extension": "xlsx", "output_name": "page-manifest.json"},
+                        {"extension": "xlsx", "profile": reader_assets.SPREADSHEET_HTML_PROFILE,
+                         "reader_mode": "html", "output_name": "document.html"},
                         source, target, work,
                     )
             convert.assert_not_called()
 
-    def test_encrypted_ole_xlsx_is_decrypted_before_spreadsheet_page_export(self):
+    def test_encrypted_ole_xlsx_is_decrypted_before_html_export(self):
         with tempfile.TemporaryDirectory() as root:
             work = Path(root)
-            source, target = work / "source.xlsx", work / "page-manifest.json"
+            source, target = work / "source.xlsx", work / "document.html"
             source.write_bytes(convert_reader_assets.OLE_SIGNATURE + b"encrypted")
             office = Mock()
             office.is_encrypted.return_value = True
@@ -1061,10 +1311,11 @@ class ConverterTests(unittest.TestCase):
             office.decrypt.side_effect = decrypt
             with patch.dict(convert_reader_assets.os.environ, {"READER_CONVERSION_PASSWORD": "secret"}), \
                     patch.dict("sys.modules", {"msoffcrypto": Mock(OfficeFile=Mock(return_value=office))}), \
-                    patch.object(convert_reader_assets, "convert_spreadsheet_to_pages") as convert:
+                    patch.object(convert_reader_assets, "convert_spreadsheet_to_html") as convert:
                 convert_reader_assets.convert_file(
-                    {"extension": "xlsx", "output_name": "page-manifest.json"},
-                    source, target, work, "a" * 64, "objects/aa/workbook/page-manifest.json",
+                    {"extension": "xlsx", "profile": reader_assets.SPREADSHEET_HTML_PROFILE,
+                     "reader_mode": "html", "output_name": "document.html"},
+                    source, target, work,
                 )
             decrypted = convert.call_args.args[0]
             self.assertEqual(decrypted.name, "decrypted.xlsx")
@@ -1155,25 +1406,6 @@ aW1hZ2U=
             with patch.object(convert_reader_assets, "convert_chm") as conversion:
                 convert_reader_assets.convert_file({"extension": "chm"}, source, target, work)
             conversion.assert_called_once_with(source, target, work)
-
-    def test_chm_conversion_repairs_images_before_validation(self):
-        with tempfile.TemporaryDirectory() as root:
-            work = Path(root)
-            source, target = work / "source.chm", work / "document.epub"
-            source.write_bytes(b"ITSF")
-
-            def convert(_command, **_kwargs):
-                target.write_bytes(b"converted")
-
-            with patch.object(convert_reader_assets, "run_checked", side_effect=convert), \
-                    patch.object(convert_reader_assets, "sanitize_chm_epub"), \
-                    patch("scripts.chm_navigation.repair_conversion"), \
-                    patch.object(convert_reader_assets, "repair_chm_epub_images") as repair_images, \
-                    patch.object(convert_reader_assets, "validate_output"), \
-                    patch.object(convert_reader_assets, "validate_chm_epub"):
-                convert_reader_assets.convert_chm(source, target, work)
-
-            repair_images.assert_called_once_with(source, target, work)
 
     def test_caj_family_detection_uses_content_not_extension(self):
         cases = {
@@ -1705,8 +1937,74 @@ aW1hZ2U=
             with self.assertRaisesRegex(RuntimeError, "page manifest is invalid"):
                 convert_reader_assets.validate_page_manifest(manifest)
 
+    def test_spreadsheet_html_overrides_sampled_pdf_and_ocr_renderings(self):
+        key = "VoiceOfML/Test\0table.xlsx"
+        source = "objects/aa/" + "a" * 64
+        spreadsheet_path = source + "/libreoffice-native-html-spreadsheet-v1/document.html"
+        pdf_path = source + "/old-pdf/pages/page-manifest.json"
+        ocr_path = source + "/old-ocr/pages/page-manifest.json"
+        manifest = {"files": {key: {
+            "status": "ready", "reader_mode": "html", "source_extension": "xlsx",
+            "profile": reader_assets.SPREADSHEET_HTML_PROFILE, "path": spreadsheet_path,
+        }}}
+        pdf_manifest = {"files": {key: {
+            "status": "ready", "strategy": "sampled-webp",
+            "render_profile": build_reader_assets_index.PDF_PROFILE,
+            "decision_profile": build_reader_assets_index.PDF_DECISION_PROFILE,
+            "path": pdf_path,
+        }}}
+        ocr_manifest = {"files": {key: {
+            "status": "rendered", "page_manifest": {"path": ocr_path},
+            "render_manifest": {"path": source + "/old-ocr/render-manifest.json"},
+        }}}
+        entry = build_reader_assets_index.build_index(
+            manifest, pdf_manifest=pdf_manifest, ocr_manifest=ocr_manifest,
+        )["f"][key]
+        self.assertEqual(entry["p"], spreadsheet_path)
+        self.assertEqual(entry["m"], "h")
+
     def test_spreadsheet_text_inventory_repairs_common_utf8_mojibake(self):
         self.assertIn("中国海军", convert_reader_assets.spreadsheet_text_variants("ä¸­å½æµ·å"))
+
+    def test_csv_inventory_preserves_quoted_multiline_cells(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "table.csv"
+            source.write_text('标题,说明\n测试,"第一行\n第二行,含逗号"\n', encoding="utf-8")
+            sheets, values, charts, images = convert_reader_assets.spreadsheet_source_inventory(source)
+        self.assertEqual(sheets, ["Sheet1"])
+        self.assertEqual(values, ["标题", "说明", "测试", "第一行\n第二行,含逗号"])
+        self.assertEqual((charts, images), (0, 0))
+
+    def test_csv_calc_import_uses_detected_delimiter(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "table.csv"
+            source.write_text("标题;说明\n测试;数据\n", encoding="utf-8")
+            self.assertEqual(render_spreadsheet_html.csv_filter_options(source), "59,34,76,1")
+
+    def test_ods_inventory_reads_sheet_text_charts_and_images(self):
+        content = '''<office:document-content
+          xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+          xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+          xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+          xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+          xmlns:xlink="http://www.w3.org/1999/xlink">
+          <office:body><office:spreadsheet><table:table table:name="Data">
+          <table:table-row><table:table-cell office:value-type="string"><text:p>年度</text:p></table:table-cell>
+          <table:table-cell office:value-type="string"><text:p>数据</text:p></table:table-cell></table:table-row>
+          <table:table-row><table:table-cell><draw:frame><draw:object xlink:href="./Object 1"/></draw:frame></table:table-cell>
+          <table:table-cell><draw:frame><draw:image xlink:href="Pictures/chart.png"/></draw:frame></table:table-cell></table:table-row>
+          </table:table><table:table table:name="Notes"/></office:spreadsheet></office:body>
+          </office:document-content>'''
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "table.ods"
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("content.xml", content)
+                archive.writestr("Object 1/content.xml", "<chart/>")
+                archive.writestr("Pictures/chart.png", b"image")
+            sheets, values, charts, images = convert_reader_assets.spreadsheet_source_inventory(source)
+        self.assertEqual(sheets, ["Data", "Notes"])
+        self.assertEqual(values, ["年度", "数据"])
+        self.assertEqual((charts, images), (1, 1))
 
     def test_spreadsheet_text_key_ignores_html_layout_whitespace(self):
         expected = "劳动者\n\t讨薪情况\n第二行"
@@ -1715,7 +2013,19 @@ aW1hZ2U=
                       convert_reader_assets.spreadsheet_text_key(
                           convert_reader_assets.extract_html_text(html_text)))
 
-    def test_spreadsheet_screenshot_keeps_full_natural_extent(self):
+    def test_spreadsheet_text_integrity_allows_inline_html_runs_but_not_missing_characters(self):
+        self.assertTrue(convert_reader_assets.spreadsheet_text_present("abcdefghij", "abcdeXfghij"))
+        self.assertFalse(convert_reader_assets.spreadsheet_text_present("abcdefghij", "abcdeXghij"))
+        expected = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!?.,;:+-*/()[]{}"
+        rendered = expected[:20] + "x" + expected[20:45] + "y" + expected[45:]
+        self.assertTrue(convert_reader_assets.spreadsheet_text_present(expected, rendered))
+        self.assertFalse(convert_reader_assets.spreadsheet_text_present(expected, rendered.replace("J", "", 1)))
+        chunked = "abcdefghijklmnop" + "qrstuvwxyzABCDEF" + "GHIJKLMNOPQRSTUV" + "WXYZ0123456789!?"
+        reordered = chunked[:16] + chunked[32:48] + chunked[16:32] + chunked[48:]
+        self.assertTrue(convert_reader_assets.spreadsheet_text_present(chunked, reordered))
+        self.assertFalse(convert_reader_assets.spreadsheet_text_present(chunked, reordered.replace(chunked[16:32], "")))
+
+    def render_fake_spreadsheet(self, dimensions):
         class FakePage:
             def __init__(self):
                 self.viewport_sizes = []
@@ -1729,7 +2039,7 @@ aW1hZ2U=
 
             def evaluate(self, script, *_args):
                 if "scrollWidth" in script:
-                    return {"width": 4200, "height": 9800}
+                    return dimensions
                 return None
 
             def set_viewport_size(self, size):
@@ -1760,11 +2070,49 @@ aW1hZ2U=
             output = Path(root) / "screenshots"
             output.mkdir()
             result = convert_reader_assets.render_spreadsheet_html([source], output)
+        return output, result, page
+
+    def test_spreadsheet_screenshot_keeps_full_natural_extent(self):
+        output, result, page = self.render_fake_spreadsheet({"width": 4200, "height": 5000})
         self.assertEqual(len(result), 1)
         self.assertEqual(page.viewport_sizes, [{"width": 4200, "height": 1600}])
         self.assertEqual(page.screenshots, [{"path": str(output / "sheet-0001.png"), "full_page": True}])
 
-    def test_xlsx_page_stream_exports_html_without_pdf_conversion(self):
+    def test_spreadsheet_full_page_capture_stays_within_webp_edge_limit(self):
+        self.assertLessEqual(convert_reader_assets.SPREADSHEET_FULL_PAGE_MAX_EDGE, 16383)
+
+    def test_huge_spreadsheet_uses_unscaled_capture_tiles(self):
+        output, result, page = self.render_fake_spreadsheet({"width": 4200, "height": 9800})
+        self.assertEqual(len(result), 21)
+        self.assertEqual(page.viewport_sizes, [{"width": 1800, "height": 1600}])
+        self.assertEqual(page.screenshots[0], {
+            "path": str(output / "sheet-0001-tile-0000-0000.png"),
+        })
+        self.assertEqual(page.screenshots[-1], {
+            "path": str(output / "sheet-0001-tile-0006-0002.png"),
+        })
+
+    def test_large_text_only_sheet_is_split_into_complete_html_row_groups(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            source = root / "sheet.html"
+            source.write_text(
+                "<html><head><style>td{width:400px}</style></head><body><table>"
+                + "".join(f"<tr><td>row-{index}</td></tr>" for index in range(5))
+                + "</table></body></html>",
+                encoding="utf-8",
+            )
+            chunks = convert_reader_assets.split_spreadsheet_html_rows(
+                [source], root / "chunks", rows_per_chunk=2,
+            )
+            rows = []
+            for chunk_path in chunks:
+                document = convert_reader_assets.lxml_html.parse(str(chunk_path))
+                rows.extend(document.xpath("//tr/td/text()"))
+                self.assertEqual(document.xpath("//style/text()"), ["td{width:400px}"])
+        self.assertEqual(rows, [f"row-{index}" for index in range(5)])
+
+    def test_spreadsheet_export_keeps_native_tables_and_embeds_charts(self):
         from PIL import Image
 
         with tempfile.TemporaryDirectory() as root:
@@ -1773,83 +2121,85 @@ aW1hZ2U=
             with zipfile.ZipFile(source, "w") as archive:
                 archive.writestr("xl/workbook.xml", '<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Summary" r:id="r1"/><sheet name="Details" r:id="r2"/></sheets></workbook>')
                 archive.writestr("xl/_rels/workbook.xml.rels", '<Relationships><Relationship Id="r1" Target="worksheets/sheet1.xml"/><Relationship Id="r2" Target="worksheets/sheet2.xml"/></Relationships>')
-                archive.writestr("xl/sharedStrings.xml", '<sst><si><t>Year</t></si><si><t>Value</t></si><si><t>完整表格</t></si><si><t>数据</t></si><si><t>隐藏资料</t></si></sst>')
+                archive.writestr("xl/sharedStrings.xml", '<sst><si><t>Year</t></si><si><t>Value</t></si><si><t>完整表格</t></si><si><t>数据</t></si></sst>')
                 archive.writestr("xl/worksheets/sheet1.xml", '<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row></sheetData></worksheet>')
-                archive.writestr("xl/worksheets/sheet2.xml", '<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>2</v></c><c r="B1" t="s"><v>3</v></c></row><row r="2" hidden="1"><c r="A2" t="s"><v>4</v></c></row></sheetData></worksheet>')
+                archive.writestr("xl/worksheets/sheet2.xml", '<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>2</v></c><c r="B1" t="s"><v>3</v></c></row></sheetData></worksheet>')
                 archive.writestr("xl/charts/chart1.xml", "<chart/>")
                 archive.writestr("xl/media/image1.png", b"image")
 
             def export_html(command, **_kwargs):
-                html_output = Path(command[-1])
-                html_output.mkdir(parents=True, exist_ok=True)
-                (html_output / "sample.html").write_text(
-                    '<a>Summary</a><a>Details</a><a href="sample_html_1.html">Summary</a>',
-                    encoding="utf-8",
+                output = Path(command[-1])
+                first = output / "sheet-0001" / "sheet.html"
+                first.parent.mkdir(parents=True)
+                first.write_text(
+                    '<html><head><style>td{border:1px solid #333}</style></head><body>'
+                    '<table><tr><td>Year</td><td>Value</td></tr><tr><td>2024</td><td>10</td></tr>'
+                    '</table><img src="chart.png"><img src="embedded.png"></body></html>', encoding="utf-8",
                 )
-                first_page = html_output / "sheet-0001" / "sheet.html"
-                first_page.parent.mkdir()
-                first_page.write_text(
-                    '<h1>Summary</h1><table><tr><td>Year</td><td>Value</td></tr>'
-                    '<tr><td>2024</td><td>10</td></tr></table><img src="chart.png"><img src="embedded.png">',
-                    encoding="utf-8",
-                )
-                second_page = html_output / "sheet-0002" / "sheet.html"
-                second_page.parent.mkdir()
-                second_page.write_text(
-                    '<h1>Details</h1><table><tr><td>完整表格</td><td>数据</td></tr></table>',
+                Image.new("RGB", (16, 12), "red").save(first.parent / "chart.png")
+                Image.new("RGB", (8, 8), "blue").save(first.parent / "embedded.png")
+                second = output / "sheet-0002" / "sheet.html"
+                second.parent.mkdir()
+                second.write_text(
+                    '<html><body><table><tr><td>完整表格</td><td>数据</td></tr></table></body></html>',
                     encoding="utf-8",
                 )
 
-            rendered = work / "rendered"
-            rendered.mkdir()
-            screenshot = rendered / "sheet.png"
-            Image.new("RGB", (2400, 3200), "white").save(screenshot)
-            target = work / "bundle/objects/aa/1234567890abcdef/page-manifest.json"
-            item = {"profile": reader_assets.SPREADSHEET_PAGE_PROFILE}
-            with patch.object(convert_reader_assets, "run_checked", side_effect=export_html) as run, \
-                    patch.object(convert_reader_assets, "validate_office_pdf") as validate_pdf, \
-                    patch.object(convert_reader_assets, "render_spreadsheet_html", return_value=[screenshot]):
-                convert_reader_assets.convert_spreadsheet_to_pages(
-                    source, target, work, item, "a" * 64, "objects/aa/" + "a" * 64
-                    + "/1234567890abcdef/page-manifest.json",
-                )
+            target = work / "bundle/document.html"
+            target.parent.mkdir()
+            item = {"extension": "xlsx", "profile": reader_assets.SPREADSHEET_HTML_PROFILE}
+            with patch.object(convert_reader_assets, "run_checked", side_effect=export_html) as run:
+                convert_reader_assets.convert_spreadsheet_to_html(source, target, work, item)
+            self.assertTrue(run.call_args.args[0][1].endswith("render_spreadsheet_html.py"))
+            document = target.read_text(encoding="utf-8")
+            self.assertIn("<table", document)
+            self.assertIn("2024", document)
+            self.assertIn("完整表格", document)
+            self.assertIn("Summary", document)
+            self.assertIn("Details", document)
+            self.assertEqual(document.count("data:image/png;base64,"), 2)
 
-            command = run.call_args.args[0]
-            self.assertTrue(command[1].endswith("render_spreadsheet_html.py"))
-            self.assertNotIn("pdf", " ".join(command).lower())
-            validate_pdf.assert_not_called()
-            manifest = json.loads(target.read_text(encoding="utf-8"))
-            self.assertEqual(manifest["page_count"], 1)
-            self.assertNotIn("pages", manifest)
-            with Image.open(target.parent / "pages" / "page-000001.webp") as page_image:
-                self.assertEqual(page_image.size, (2400, 3200))
+    def test_xlsx_bucket_contract_uses_native_html(self):
+        self.assertEqual(reader_assets.bucket_conversion_contract(
+            "repo", "table.xlsx", "xlsx",
+        ), (reader_assets.SPREADSHEET_HTML_PROFILE, "html", "document.html"))
+        with tempfile.TemporaryDirectory() as root:
+            work = Path(root)
+            source, target = work / "sample.xlsx", work / "document.html"
+            source.write_bytes(b"xlsx workbook")
+            with patch.object(convert_reader_assets, "convert_spreadsheet_to_html") as convert:
+                convert_reader_assets.convert_file({
+                    "extension": "xlsx", "profile": reader_assets.SPREADSHEET_HTML_PROFILE,
+                    "reader_mode": "html", "output_name": "document.html",
+                }, source, target, work)
+            convert.assert_called_once()
 
-    def test_mislabeled_ole_xlsx_uses_legacy_workbook_extension_for_html_render(self):
+    def test_mislabeled_ole_xlsx_uses_legacy_workbook_extension_for_html_export(self):
         with tempfile.TemporaryDirectory() as root:
             work = Path(root)
             source = work / "source.xlsx"
             source.write_bytes(convert_reader_assets.OLE_SIGNATURE + b"legacy workbook")
-            with patch.object(convert_reader_assets, "convert_spreadsheet_to_pages") as convert:
+            with patch.object(convert_reader_assets, "convert_spreadsheet_to_html") as convert:
                 convert_reader_assets.convert_file(
-                    {"extension": "xlsx", "output_name": "page-manifest.json"},
-                    source, work / "page-manifest.json", work, "a" * 64,
-                    "objects/aa/" + "a" * 64 + "/1234567890abcdef/page-manifest.json",
+                    {"extension": "xlsx", "profile": reader_assets.SPREADSHEET_HTML_PROFILE,
+                     "reader_mode": "html", "output_name": "document.html"},
+                    source, work / "document.html", work,
                 )
             rendered_source = convert.call_args.args[0]
             self.assertEqual(rendered_source.suffix, ".xls")
             self.assertEqual(rendered_source.read_bytes(), source.read_bytes())
 
-    def test_xls_extension_with_ooxml_content_uses_xlsx_extension_for_html_render(self):
+    def test_xls_extension_with_ooxml_content_uses_xlsx_extension_for_html_export(self):
         with tempfile.TemporaryDirectory() as root:
             work = Path(root)
             source = work / "source.xls"
             with zipfile.ZipFile(source, "w") as archive:
                 archive.writestr("xl/workbook.xml", "<workbook/>")
-            with patch.object(convert_reader_assets, "convert_spreadsheet_to_pages") as convert:
+            with patch.object(convert_reader_assets, "convert_spreadsheet_to_html") as convert:
                 convert_reader_assets.convert_file(
-                    {"extension": "xls", "output_name": "page-manifest.json"},
-                    source, work / "page-manifest.json", work, "a" * 64,
-                    "objects/aa/" + "a" * 64 + "/1234567890abcdef/page-manifest.json",
+                    {"extension": "xls", "profile": reader_assets.SPREADSHEET_HTML_PROFILE,
+                     "reader_mode": "html", "output_name": "document.html"},
+                    source, work / "document.html", work,
                 )
             rendered_source = convert.call_args.args[0]
             self.assertEqual(rendered_source.suffix, ".xlsx")
@@ -2089,7 +2439,38 @@ aW1hZ2U=
             conversion.assert_not_called()
             reused.assert_called_once()
             self.assertTrue(result["reused"])
-            self.assertEqual(result["sha256"], hashlib.sha256(artifact).hexdigest())
+        self.assertEqual(result["sha256"], hashlib.sha256(artifact).hexdigest())
+
+    def test_missing_remote_reusable_artifact_falls_back_to_conversion(self):
+        item = {
+            "key": "VoiceOfML/Test\0Missing.djvu", "extension": "djvu",
+            "source_url": "https://example.test/missing.djvu", "source_revision": "rev1",
+            "profile": "djvulibre-pdf-v1", "reader_mode": "pdf", "output_name": "document.pdf",
+        }
+        digest = "a" * 64
+        reusable = {f"{digest}\0djvulibre-pdf-v1": {
+            "path": f"objects/aa/{digest}/djvulibre-pdf-v1/document.pdf",
+            "bytes": 12, "sha256": "b" * 64,
+        }}
+        with tempfile.TemporaryDirectory() as root:
+            def download(_url, target):
+                target.write_bytes(b"source")
+                return digest, 6
+
+            def missing(_url, _target, _digest):
+                raise urllib.error.HTTPError(_url, 404, "missing", {}, None)
+
+            def convert(_item, _source, target, _work):
+                target.write_bytes(b"%PDF-rebuilt")
+
+            with patch.object(convert_reader_assets, "download_source", side_effect=download), \
+                    patch.object(convert_reader_assets, "download_existing", side_effect=missing), \
+                    patch.object(convert_reader_assets, "convert_file", side_effect=convert), \
+                    patch.object(convert_reader_assets, "validate_djvu_pdf"), \
+                    patch.object(convert_reader_assets, "validate_reader_content"):
+                result = convert_reader_assets.convert_item(item, Path(root), reusable)
+        self.assertFalse(result["reused"])
+        self.assertEqual(result["path"], reusable[f"{digest}\0djvulibre-pdf-v1"]["path"])
 
     def test_pdf_reuses_existing_dataset_artifact_path(self):
         item = {
@@ -2287,11 +2668,13 @@ class PublicationTests(unittest.TestCase):
             {"status": "ready", "reader_mode": "docx", "path": "objects/aa/document.docx"},
             {"status": "ready", "reader_mode": "html", "path": "objects/bb/document.html"},
             {"status": "ready", "reader_mode": "foliate", "path": "objects/cc/document.epub"},
-            {"status": "ready", "reader_mode": "audio", "path": "objects/dd/audio.mp3"},
+            {"status": "ready", "reader_mode": "audio", "path": "objects/dd/native-media-cdn-v1/audio.flac"},
+            {"status": "ready", "reader_mode": "video", "path": "objects/ee/native-media-cdn-v1/video.mp4"},
             {"status": "ready", "reader_mode": "pdf", "path": "objects/ee/document.pdf"},
         ]}
         self.assertEqual(publish_reader_assets.bucket_paths(data), [
             "objects/aa/document.docx", "objects/bb/document.html", "objects/cc/document.epub",
+            "objects/dd/native-media-cdn-v1/audio.flac", "objects/ee/native-media-cdn-v1/video.mp4",
         ])
 
     def test_spreadsheet_page_manifest_is_a_bucket_upload_candidate(self):
@@ -2379,6 +2762,25 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(kwargs["ExtraArgs"]["ContentType"],
                          "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         fake_client.head_object.assert_called_once_with(Bucket="pdf-pages", Key="objects/aa/document.docx")
+
+    def test_s3_reader_upload_retries_stale_size_after_overwrite(self):
+        fake_client = Mock()
+        fake_client.head_object.side_effect = [
+            {"ContentLength": 4}, {"ContentLength": 5},
+        ]
+        with tempfile.TemporaryDirectory() as root, patch.dict("os.environ", {
+            "HF_S3_ACCESS_KEY_ID": "key", "HF_S3_SECRET_ACCESS_KEY": "secret",
+            "HF_S3_NAMESPACE": "vomebook", "HF_S3_UPLOAD_WORKERS": "1",
+        }), patch.object(publish_reader_assets, "_s3_client", return_value=fake_client), \
+                patch.object(publish_reader_assets.time, "sleep"):
+            local = Path(root) / "lifecycle.json"
+            local.write_bytes(b"asset")
+            publish_reader_assets.s3_upload_artifacts(
+                {"reader-index/reader_lifecycle.json": (Path(root), str(local))},
+                "vomebook/pdf-pages",
+            )
+        self.assertEqual(fake_client.upload_file.call_count, 2)
+        self.assertEqual(fake_client.head_object.call_count, 2)
 
     def test_s3_reader_upload_retries_multipart_read_timeout(self):
         from botocore.exceptions import ReadTimeoutError
@@ -2976,8 +3378,12 @@ class PruneTests(unittest.TestCase):
 class WorkflowContractTests(unittest.TestCase):
     def test_workflow_exposes_incremental_controls_and_excludes_pdg(self):
         workflow = Path(".github/workflows/reader-assets.yml").read_text(encoding="utf-8")
+        self.assertIn('cron: "23 3 * * 0"', workflow)
+        self.assertIn("inputs.bucket_migrate || 'true'", workflow)
         for field in ("repo:", "extension:", "limit:", "checkpoint_batches:", "retry_failed:", "force:", "dry_run:"):
             self.assertIn(field, workflow)
+        self.assertIn("clean_rebuild:", workflow)
+        self.assertIn("--clean-rebuild --force --bucket-migrate", workflow)
         self.assertNotIn("pdg", workflow.lower())
         self.assertIn("publish_search_reader_index.py", workflow)
         self.assertIn("fonts-noto-cjk", workflow)
@@ -2988,7 +3394,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("djvulibre-bin", workflow)
         self.assertIn("doc, docx, epub, htm, html, mobi, azw3, fb2, odt, rtf", workflow)
         self.assertIn("chm, tif, tiff, djvu, ppt, pptx, pps, odp", workflow)
-        self.assertIn("htm|html) packages=()", workflow)
+        self.assertIn("htm|html|swf) packages=()", workflow)
         self.assertIn("inputs.limit || '20'", workflow)
         self.assertIn("inputs.checkpoint_batches || '30'", workflow)
         self.assertIn("python scripts/publish_reader_assets.py", workflow)
@@ -3003,15 +3409,16 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("chm) packages=(calibre p7zip-full)", workflow)
         self.assertIn("tif|tiff) packages=(poppler-utils)", workflow)
         self.assertIn("mht|mhtml) packages=()", workflow)
-        self.assertIn("pip install -r scripts/requirements-spreadsheet-render.txt", workflow)
-        self.assertIn("playwright install --with-deps chromium", workflow)
-        self.assertIn("libreoffice-calc python3-uno", workflow)
+        self.assertNotIn("requirements-spreadsheet-render.txt", workflow)
+        self.assertNotIn("playwright install --with-deps chromium", workflow)
+        self.assertIn('"${INPUT_EXTENSION}" == "csv" || "${INPUT_EXTENSION}" == "ods"', workflow)
+        self.assertIn("libreoffice-calc python3-uno fontconfig", workflow)
         self.assertNotIn("bucket_pdf_staging", workflow)
         self.assertIn("ps) packages=(ghostscript poppler-utils)", workflow)
         self.assertIn("caj|kdh) packages=(git mupdf-tools poppler-utils", workflow)
         self.assertIn("checkout --detach 6c4bc32b15ce748d211f45d536f5d5511ef9f368", workflow)
         self.assertIn("CAJ2PDF_DIR: /opt/caj2pdf", workflow)
-        self.assertIn("ape|wma|amr|flv|f4v|rm|rmvb|mkv|avi|mpg|mpeg|mts|ts|wmv) packages=(ffmpeg)", workflow)
+        self.assertIn("ape|wma|amr|mp3|wav|m4a|flac|mpga|mp4|mov|asx|flv|f4v|rm|rmvb|mkv|avi|mpg|mpeg|mts|ts|wmv) packages=(ffmpeg)", workflow)
         self.assertIn("READER_CONVERSION_WORKERS:", workflow)
         self.assertIn("needs.plan.outputs.extension == 'djvu'", workflow)
         self.assertIn("needs.plan.outputs.count != '0'", workflow)
@@ -3020,6 +3427,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('--queue "${queue}"', workflow)
         self.assertIn("Convert assigned queue", workflow)
         self.assertIn("Reader metadata request failed; retrying", workflow)
+        self.assertIn("inputs.retry_failed || github.event_name == 'schedule'", workflow)
         self.assertIn("READER_CHM_COMMAND_TIMEOUT:", workflow)
         self.assertIn("READER_DJVU_COMMAND_TIMEOUT:", workflow)
         self.assertIn("Source metadata request failed; retrying", workflow)

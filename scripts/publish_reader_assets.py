@@ -3,7 +3,6 @@
 
 import argparse
 import concurrent.futures
-import gzip
 import json
 import mimetypes
 import os
@@ -25,7 +24,7 @@ try:
     from .reader_assets import (
         MANIFEST_NAME, READER_ASSETS_REPO, canonical_json, empty_manifest, load_json,
         reusable_object_key, validate_manifest, validate_storage_path,
-        READER_ASSETS_BUCKET, restore_bucket_media_mappings,
+        READER_ASSETS_BUCKET,
     )
 except ImportError:
     from build_reader_assets_index import encode_index
@@ -34,7 +33,7 @@ except ImportError:
     from reader_assets import (
         MANIFEST_NAME, READER_ASSETS_REPO, canonical_json, empty_manifest, load_json,
         reusable_object_key, validate_manifest, validate_storage_path,
-        READER_ASSETS_BUCKET, restore_bucket_media_mappings,
+        READER_ASSETS_BUCKET,
     )
 
 try:
@@ -45,6 +44,10 @@ except ImportError:
 SIDECAR_NAME = "reader_assets.json.gz"
 BUCKET_READER_MODES = {"docx", "html", "text", "markdown", "image", "foliate", "epub", "audio", "video", "swf"}
 EBOOK_CHAPTERS_PREFIX = "ebook-chapters/"
+
+
+class S3UploadSizeMismatch(RuntimeError):
+    """The upload succeeded but HEAD still returned stale object metadata."""
 
 
 def bucket_chapter_path(path: str) -> str:
@@ -268,7 +271,10 @@ def s3_upload_artifacts(artifacts: dict[str, tuple[Path, str]], bucket: str,
                 )
                 uploaded = client.head_object(Bucket=bucket_name, Key=remote_path)
                 if uploaded.get("ContentLength") != expected_bytes:
-                    raise RuntimeError(f"uploaded Reader object size mismatch: {remote_path}")
+                    # HF S3 can briefly return the previous object metadata
+                    # immediately after an overwrite. Treat that as transient
+                    # and verify again after re-uploading with backoff.
+                    raise S3UploadSizeMismatch(remote_path)
                 return
             except Exception as error:
                 response = getattr(error, "response", None) or {}
@@ -276,12 +282,14 @@ def s3_upload_artifacts(artifacts: dict[str, tuple[Path, str]], bucket: str,
                 code = response.get("Error", {}).get("Code")
                 timeout_error = isinstance(error, (ConnectTimeoutError, ReadTimeoutError, TimeoutError))
                 retryable = (timeout_error
+                              or isinstance(error, S3UploadSizeMismatch)
                               or status in {408, 429, 500, 502, 503, 504}
                               or code in {"SlowDown", "RequestTimeout"})
                 if not retryable or attempt + 1 == max_attempts:
                     raise
                 delay = shared.hf_retry_delay(attempt, cap=120) + random.uniform(0, 2)
-                reason = "timeout" if timeout_error else (code or status)
+                reason = ("stale object metadata" if isinstance(error, S3UploadSizeMismatch)
+                          else "timeout" if timeout_error else (code or status))
                 print(f"transient S3 Reader upload error ({reason}); retrying in {delay:.1f}s")
                 time.sleep(delay)
 
@@ -355,15 +363,11 @@ def file_sha256(path: Path) -> str:
 def remote_manifest(api: HfApi, repo_id: str, revision: str | None = None) -> dict:
     if isinstance(api, HfApi):
         try:
-            token = os.environ.get("HF_TOKEN")
-            manifest = read_bucket_json(INDEX_FILES["manifest"], token)
-            try:
-                lifecycle = read_bucket_json(INDEX_FILES["lifecycle"], token)
-            except (FileNotFoundError, OSError, ValueError):
-                lifecycle = {"version": 1, "files": {}}
-            return validate_manifest(restore_bucket_media_mappings(manifest, lifecycle))
-        except (FileNotFoundError, OSError, ValueError):
-            pass
+            return validate_manifest(read_bucket_json(INDEX_FILES["manifest"], os.environ.get("HF_TOKEN")))
+        except (FileNotFoundError, OSError, ValueError) as error:
+            raise RuntimeError(
+                "Reader bucket manifest is unavailable; refusing to publish against a stale dataset manifest"
+            ) from error
     try:
         if not api.file_exists(
                 repo_id=repo_id, repo_type="dataset", filename=MANIFEST_NAME, revision=revision):
@@ -531,20 +535,6 @@ def build_publish(api: HfApi, repo_id: str, bundle: Path, revision: str | None =
                         "sha256": entry["sha256"],
                         "reader_mode": entry["reader_mode"],
                     }
-    # Bucket-only migrations can arrive while the bucket index is being
-    # refreshed by another publish shard. Keep the current shard's ready
-    # bucket mappings in the manifest we are about to publish as well.
-    for result in data["results"]:
-        if result.get("status") != "ready" or result.get("reader_mode") not in BUCKET_READER_MODES:
-            continue
-        entry = {key: value for key, value in result.items() if key != "key"}
-        entry["bucket"] = READER_ASSETS_BUCKET
-        if entry.get("chapter_manifest"):
-            if data.get("bucket_migration"):
-                entry["chapter_manifest"] = bucket_chapter_path(entry["chapter_manifest"])
-            entry["chapter_bucket"] = READER_ASSETS_BUCKET
-        files[result["key"]] = entry
-
     active_keys = set(data.get("active_keys", []))
     if data.get("authoritative_snapshot") is True:
         for key in set(files) - active_keys:
@@ -736,35 +726,6 @@ def publish_bucket_bundle(api: HfApi, repo_id: str, bundle: Path, data: dict,
                     {"results": [result]}, (artifact_roots or {}).get(result.get("path"), bundle))
                 updates.append(asset_record(item))
             lifecycle = merge_lifecycle(lifecycle, updates)
-            # The bucket lifecycle is the durable object inventory. A delayed
-            # manifest read from another publish shard must not erase mappings
-            # that are already finalized in that inventory.
-            for key, record in lifecycle.get("files", {}).items():
-                current = manifest.get("files", {}).get(key, {})
-                if (record.get("phase") != "final"
-                        or current.get("bucket") == READER_ASSETS_BUCKET):
-                    continue
-                profile = str(record.get("profile") or "")
-                if profile.startswith("native-swf-"):
-                    reader_mode = "swf"
-                elif profile == "native-media-cdn-v1":
-                    reader_mode = "audio" if Path(record.get("path", "")).name.startswith("audio.") else "video"
-                elif profile.startswith("ffmpeg-audio-"):
-                    reader_mode = "audio"
-                elif profile.startswith("ffmpeg-video-"):
-                    reader_mode = "video"
-                else:
-                    continue
-                source_extension = key.rsplit(".", 1)[-1].lower()
-                manifest.setdefault("files", {})[key] = {
-                    "status": "ready", "source_revision": record.get("source_revision", ""),
-                    "source_sha256": record.get("source_sha256", ""),
-                    "source_extension": source_extension, "profile": profile,
-                    "reader_mode": reader_mode, "path": record["path"],
-                    "bytes": record["bytes"], "sha256": record["sha256"],
-                    "bucket": READER_ASSETS_BUCKET,
-                }
-            validate_manifest(manifest)
             with tempfile.TemporaryDirectory(prefix="reader-index-") as root:
                 index_root = Path(root) / "reader-index"
                 index_root.mkdir(parents=True, exist_ok=True)
@@ -773,19 +734,6 @@ def publish_bucket_bundle(api: HfApi, repo_id: str, bundle: Path, data: dict,
                                if operation.path_in_repo == SIDECAR_NAME)
                 if isinstance(sidecar, str):
                     sidecar = Path(sidecar).read_bytes()
-                sidecar_data = json.loads(gzip.decompress(sidecar))
-                sidecar_files = sidecar_data.setdefault("f", {})
-                for key, entry in manifest.get("files", {}).items():
-                    if key in sidecar_files or entry.get("reader_mode") not in {"audio", "video", "swf"}:
-                        continue
-                    mode = {"audio": "a", "video": "v", "swf": "f"}[entry["reader_mode"]]
-                    sidecar_files[key] = {
-                        "s": 2, "m": mode, "p": entry["path"], "b": READER_ASSETS_BUCKET,
-                    }
-                sidecar = gzip.compress(
-                    json.dumps(sidecar_data, ensure_ascii=False, sort_keys=True,
-                               separators=(",", ":")).encode(), mtime=0,
-                )
                 (index_root / SIDECAR_NAME).write_bytes(sidecar)
                 (index_root / INDEX_FILES["lifecycle"].rsplit("/", 1)[-1]).write_text(
                     json.dumps(lifecycle, ensure_ascii=False, sort_keys=True, indent=2) + "\n",

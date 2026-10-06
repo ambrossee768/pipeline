@@ -1,6 +1,8 @@
 name: Build Reader Assets
 
 on:
+  schedule:
+    - cron: "23 3 * * 0"
   workflow_dispatch:
     inputs:
       repo:
@@ -9,7 +11,7 @@ on:
         default: ""
         type: string
       extension:
-        description: txt, md, markdown, jpg, jpeg, png, gif, bmp, webp, doc, docx, epub, htm, html, mobi, azw3, fb2, odt, rtf, chm, tif, tiff, djvu, ppt, pptx, pps, odp, xls, xlsx, csv, ods, wps, mht, mhtml, ps, caj, kdh, or blank
+        description: txt, md, markdown, jpg, jpeg, png, gif, bmp, webp, doc, docx, epub, htm, html, mobi, azw3, fb2, odt, rtf, chm, tif, tiff, djvu, ppt, pptx, pps, odp, xls, xlsx, csv, ods, wps, mht, mhtml, ps, caj, kdh, mp3, wav, m4a, flac, mpga, mp4, mov, asx, swf, flv, f4v, rm, rmvb, mkv, avi, mpg, mpeg, mts, ts, wmv, or blank
         required: false
         default: ""
         type: string
@@ -38,6 +40,11 @@ on:
         required: false
         default: false
         type: boolean
+      clean_rebuild:
+        description: Rebuild every non-PDF Reader asset and replace the complete current mapping snapshot
+        required: false
+        default: false
+        type: boolean
       bucket_migrate:
         description: Publish final static Reader artifacts to the existing pdf-pages bucket (PDF/OCR and ebook chapter flows stay on their dedicated pipelines)
         required: false
@@ -55,7 +62,7 @@ on:
         type: string
 
 concurrency:
-  group: reader-assets
+  group: reader-general
   cancel-in-progress: false
   queue: max
 
@@ -63,6 +70,10 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      group: reader-sidecar
+      cancel-in-progress: false
+      queue: max
     outputs:
       extension: ${{ steps.scan.outputs.extension }}
       count: ${{ steps.scan.outputs.count }}
@@ -124,9 +135,10 @@ jobs:
             --path "${INPUT_PATH}"
             --limit "${total_limit}"
           )
-          if [[ "${{ inputs.retry_failed }}" == "true" ]]; then args+=(--retry-failed); fi
+          if [[ "${{ inputs.retry_failed || github.event_name == 'schedule' }}" == "true" ]]; then args+=(--retry-failed); fi
           if [[ "${{ inputs.force }}" == "true" ]]; then args+=(--force); fi
-          if [[ "${{ inputs.bucket_migrate }}" == "true" ]]; then args+=(--bucket-migrate); fi
+          if [[ "${{ inputs.clean_rebuild }}" == "true" ]]; then args+=(--clean-rebuild --force --bucket-migrate); fi
+          if [[ "${{ inputs.bucket_migrate || 'true' }}" == "true" ]]; then args+=(--bucket-migrate); fi
           retry_reader_command python scripts/scan_reader_assets.py "${args[@]}"
           python scripts/prepare_reader_assets_plan.py
       - name: Package conversion plan
@@ -174,9 +186,7 @@ jobs:
           packages=()
           case "${EXTENSION}" in
             static)
-              if [[ "${INPUT_EXTENSION}" == "ape" || "${INPUT_EXTENSION}" == "wma" || "${INPUT_EXTENSION}" == "amr" || "${INPUT_EXTENSION}" == "mp3" || "${INPUT_EXTENSION}" == "wav" || "${INPUT_EXTENSION}" == "m4a" || "${INPUT_EXTENSION}" == "flac" || "${INPUT_EXTENSION}" == "mpga" || "${INPUT_EXTENSION}" == "mp4" || "${INPUT_EXTENSION}" == "mov" || "${INPUT_EXTENSION}" == "asx" || "${INPUT_EXTENSION}" == "flv" || "${INPUT_EXTENSION}" == "f4v" || "${INPUT_EXTENSION}" == "rm" || "${INPUT_EXTENSION}" == "rmvb" || "${INPUT_EXTENSION}" == "mkv" || "${INPUT_EXTENSION}" == "avi" || "${INPUT_EXTENSION}" == "mpg" || "${INPUT_EXTENSION}" == "mpeg" || "${INPUT_EXTENSION}" == "mts" || "${INPUT_EXTENSION}" == "ts" || "${INPUT_EXTENSION}" == "wmv" ]]; then
-                packages=(ffmpeg)
-              elif [[ "${INPUT_EXTENSION}" == "xls" || "${INPUT_EXTENSION}" == "xlsx" ]]; then
+              if [[ "${INPUT_EXTENSION}" == "xls" || "${INPUT_EXTENSION}" == "xlsx" || "${INPUT_EXTENSION}" == "csv" || "${INPUT_EXTENSION}" == "ods" ]]; then
                 packages=(libreoffice-calc python3-uno fontconfig fonts-noto-cjk fonts-wqy-microhei)
               else
                 packages=(calibre libreoffice qpdf ghostscript poppler-utils p7zip-full fontconfig fonts-noto-cjk fonts-wqy-microhei)
@@ -184,7 +194,7 @@ jobs:
               ;;
             pdf) packages=(qpdf poppler-utils) ;;
             doc|docx|ppt|pptx|pps|odp|xls|xlsx|csv|ods|wps) packages=(libreoffice qpdf fontconfig fonts-noto-cjk fonts-wqy-microhei ghostscript poppler-utils tesseract-ocr tesseract-ocr-chi-sim) ;;
-            htm|html) packages=() ;;
+            htm|html|swf) packages=() ;;
             epub) packages=(calibre qpdf) ;;
             mobi|azw3|fb2) packages=(calibre) ;;
             odt) packages=(libreoffice) ;;
@@ -201,12 +211,6 @@ jobs:
           if ((${#packages[@]})); then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends "${packages[@]}"
-          fi
-          if [[ "${INPUT_EXTENSION}" == "xls" || "${INPUT_EXTENSION}" == "xlsx" ]]; then
-            pip install -r scripts/requirements-spreadsheet-render.txt
-            if ! command -v google-chrome >/dev/null && ! command -v google-chrome-stable >/dev/null; then
-              python -m playwright install --with-deps chromium
-            fi
           fi
           if [[ "${EXTENSION}" == "caj" || "${EXTENSION}" == "kdh" ]]; then
             sudo git clone --filter=blob:none --no-checkout https://github.com/caj2pdf/caj2pdf.git /opt/caj2pdf

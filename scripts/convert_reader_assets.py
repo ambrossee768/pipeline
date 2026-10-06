@@ -4,6 +4,8 @@
 import argparse
 import concurrent.futures
 import base64
+import copy
+import csv
 import email.policy
 import hashlib
 import html
@@ -21,6 +23,7 @@ import http.client
 import urllib.error
 import urllib.request
 import urllib.parse
+import warnings
 import zipfile
 import os
 import posixpath
@@ -28,6 +31,7 @@ import xml.etree.ElementTree as ET
 from email.parser import BytesParser
 from html.parser import HTMLParser
 from pathlib import Path
+from lxml import html as lxml_html
 
 import bleach
 import tinycss2
@@ -37,12 +41,16 @@ from PIL import Image, ImageSequence
 
 try:
     from .reader_assets import (
-        EPUB_CHAPTER_BUNDLE_DIR, EPUB_CHAPTER_PROFILE, GBK_PDF_CONTRACT, NATIVE_MEDIA_PROFILE, PASSWORD_RE, canonical_json, load_json, needs_epub_chapters,
+        EPUB_CHAPTER_BUNDLE_DIR, EPUB_CHAPTER_PROFILE, GBK_PDF_CONTRACT, NATIVE_MEDIA_PROFILE,
+        SPREADSHEET_HTML_PROFILE,
+        PASSWORD_RE, canonical_json, load_json, needs_epub_chapters,
         object_profile_path, reusable_object_key, source_password, validate_storage_path,
     )
 except ImportError:
     from reader_assets import (
-        EPUB_CHAPTER_BUNDLE_DIR, EPUB_CHAPTER_PROFILE, GBK_PDF_CONTRACT, NATIVE_MEDIA_PROFILE, PASSWORD_RE, canonical_json, load_json, needs_epub_chapters,
+        EPUB_CHAPTER_BUNDLE_DIR, EPUB_CHAPTER_PROFILE, GBK_PDF_CONTRACT, NATIVE_MEDIA_PROFILE,
+        SPREADSHEET_HTML_PROFILE,
+        PASSWORD_RE, canonical_json, load_json, needs_epub_chapters,
         object_profile_path, reusable_object_key, source_password, validate_storage_path,
     )
 
@@ -52,6 +60,9 @@ except ImportError:
     import shared
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_READER_IMAGE_PIXELS = 300_000_000
+MAX_READER_IMAGE_EDGE = 16_000
+READER_IMAGE_LOCK = threading.Lock()
 MAX_HTML_RESOURCE_BYTES = 16 * 1024 * 1024
 MAX_HTML_RESOURCE_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_HTML_RESOURCES = 64
@@ -90,6 +101,8 @@ COMMAND_TIMEOUT_SECONDS = int(os.environ.get("READER_CONVERSION_COMMAND_TIMEOUT"
 SPREADSHEET_RENDER_COMMAND_TIMEOUT_SECONDS = max(
     1800, int(os.environ.get("READER_SPREADSHEET_RENDER_TIMEOUT", str(COMMAND_TIMEOUT_SECONDS)))
 )
+SPREADSHEET_FULL_PAGE_MAX_PIXELS = 24_000_000
+SPREADSHEET_FULL_PAGE_MAX_EDGE = 16_000
 EPUB_COMMAND_TIMEOUT_SECONDS = max(1800, int(os.environ.get(
     "READER_EPUB_COMMAND_TIMEOUT", str(COMMAND_TIMEOUT_SECONDS),
 )))
@@ -113,9 +126,8 @@ ARTIFACT_LOCKS_GUARD = threading.Lock()
 
 
 def download_source(url: str, target: Path, *, max_bytes: int = MAX_SOURCE_BYTES) -> tuple[str, int]:
-    # HF's resolve endpoint can briefly return 404 while a dataset revision is
-    # being propagated. A stale partial file must not turn the next retry into
-    # an invalid range request.
+    # HF resolve URLs can briefly return 404 while a dataset revision is
+    # propagating. Do not resume a stale partial file after that response.
     for attempt in range(5):
         offset = target.stat().st_size if target.exists() else 0
         headers = {"User-Agent": "VoiceOfML-Reader-Assets/1.0"}
@@ -160,7 +172,7 @@ def download_source(url: str, target: Path, *, max_bytes: int = MAX_SOURCE_BYTES
             error = exc
         except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead) as exc:
             error = exc
-        if attempt == 2:
+        if attempt == 4:
             raise error
         time.sleep(attempt + 1)
     raise RuntimeError("source download retry limit reached")
@@ -432,6 +444,22 @@ def download_existing(url: str, target: Path, expected_sha256: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def is_remote_not_found(error: Exception) -> bool:
+    """Whether a reusable dataset object disappeared and can be rebuilt."""
+    status = getattr(error, "code", None)
+    response = getattr(error, "response", None)
+    if status in {404, 410, "404", "410"}:
+        return True
+    if isinstance(response, dict):
+        if response.get("status_code") in {404, 410}:
+            return True
+        if response.get("Error", {}).get("Code") in {"404", "410", "NotFound", "NoSuchKey"}:
+            return True
+        if response.get("ResponseMetadata", {}).get("HTTPStatusCode") in {404, 410}:
+            return True
+    return False
+
+
 def file_sha256(path: Path) -> str:
     return shared.hash_file(path)[0]
 
@@ -533,11 +561,7 @@ def validate_media_output(path: Path, reader_mode: str) -> None:
         raise RuntimeError("media output contains unsupported streams")
     if reader_mode == "audio":
         if len(audio) != 1 or video or audio[0].get("codec_name") != "mp3" or "mp3" not in format_names:
-            raise RuntimeError(
-                "conversion output is not compatible MP3 audio "
-                f"(streams={[(s.get('codec_type'), s.get('codec_name')) for s in streams]}, "
-                f"format={media_format.get('format_name')})"
-            )
+            raise RuntimeError("conversion output is not compatible MP3 audio")
         return
     if reader_mode != "video" or len(video) != 1 or len(audio) > 1:
         raise RuntimeError("conversion output has invalid video streams")
@@ -546,6 +570,49 @@ def validate_media_output(path: Path, reader_mode: str) -> None:
             or not 0 < width <= 1920 or not 0 < height <= 1080
             or (audio and audio[0].get("codec_name") != "aac")):
         raise RuntimeError("conversion output is not compatible H.264/AAC video")
+
+
+def browser_native_media(path: Path, extension: str, reader_mode: str) -> bool:
+    probe = media_probe(path)
+    streams = probe.get("streams") if isinstance(probe, dict) else None
+    media_format = probe.get("format") if isinstance(probe, dict) else None
+    if not isinstance(streams, list) or not isinstance(media_format, dict):
+        raise RuntimeError("source media has no stream metadata")
+    format_names = set(str(media_format.get("format_name") or "").split(","))
+    audio = [stream for stream in streams if stream.get("codec_type") == "audio"]
+    video = [stream for stream in streams if stream.get("codec_type") == "video"
+             and not stream.get("disposition", {}).get("attached_pic")]
+    if reader_mode == "audio":
+        if not audio or video:
+            raise RuntimeError("native audio asset has invalid streams")
+        codec = str(audio[0].get("codec_name") or "")
+        if extension in {"mp3", "mpga"}:
+            return codec == "mp3"
+        if extension == "wav":
+            return "wav" in format_names and codec.startswith("pcm_")
+        if extension == "flac":
+            return codec == "flac"
+        if extension == "m4a":
+            return codec == "aac"
+        return False
+    if reader_mode != "video" or len(video) != 1 or len(audio) > 1:
+        raise RuntimeError("native video asset has invalid streams")
+    return (video[0].get("codec_name") == "h264" and video[0].get("pix_fmt") == "yuv420p"
+            and (not audio or audio[0].get("codec_name") == "aac")
+            and bool(format_names.intersection({"mov", "mp4", "m4a", "3gp", "3g2", "mj2"})))
+
+
+def prepare_native_media_item(item: dict, source: Path) -> dict:
+    if item.get("profile") != NATIVE_MEDIA_PROFILE:
+        return item
+    if browser_native_media(source, item["extension"], item["reader_mode"]):
+        return item
+    prepared = dict(item)
+    if item["reader_mode"] == "audio":
+        prepared.update(profile="ffmpeg-audio-mp3-v1", output_name="audio.mp3", transcode_media=True)
+    else:
+        prepared.update(profile="ffmpeg-video-mp4-h264-aac-v1", output_name="video.mp4", transcode_media=True)
+    return prepared
 
 
 def validate_native_media_output(path: Path, reader_mode: str) -> None:
@@ -560,49 +627,13 @@ def validate_native_media_output(path: Path, reader_mode: str) -> None:
         raise RuntimeError("native media output has invalid duration") from exc
     if not 0 < duration <= 24 * 60 * 60:
         raise RuntimeError("native media output duration is outside limits")
-    audio = [s for s in streams if s.get("codec_type") == "audio"]
-    video = [s for s in streams if s.get("codec_type") == "video"
-             and not s.get("disposition", {}).get("attached_pic")]
+    audio = [stream for stream in streams if stream.get("codec_type") == "audio"]
+    video = [stream for stream in streams if stream.get("codec_type") == "video"
+             and not stream.get("disposition", {}).get("attached_pic")]
     if reader_mode == "audio" and (not audio or video):
         raise RuntimeError("native audio output has invalid streams")
     if reader_mode == "video" and (len(video) != 1 or len(audio) > 1):
         raise RuntimeError("native video output has invalid streams")
-
-
-def browser_native_media(path: Path, extension: str, reader_mode: str) -> bool:
-    probe = media_probe(path)
-    streams = probe.get("streams") if isinstance(probe, dict) else None
-    media_format = probe.get("format") if isinstance(probe, dict) else None
-    if not isinstance(streams, list) or not isinstance(media_format, dict):
-        raise RuntimeError("source media has no stream metadata")
-    names = set(str(media_format.get("format_name") or "").split(","))
-    audio = [s for s in streams if s.get("codec_type") == "audio"]
-    video = [s for s in streams if s.get("codec_type") == "video"
-             and not s.get("disposition", {}).get("attached_pic")]
-    if reader_mode == "audio":
-        if not audio or video:
-            raise RuntimeError("native audio asset has invalid streams")
-        codec = str(audio[0].get("codec_name") or "")
-        return ((extension in {"mp3", "mpga"} and codec == "mp3")
-                or (extension == "wav" and "wav" in names and codec.startswith("pcm_"))
-                or (extension == "flac" and codec == "flac")
-                or (extension == "m4a" and codec == "aac"))
-    if reader_mode != "video" or len(video) != 1 or len(audio) > 1:
-        raise RuntimeError("native video asset has invalid streams")
-    return (video[0].get("codec_name") == "h264" and video[0].get("pix_fmt") == "yuv420p"
-            and (not audio or audio[0].get("codec_name") == "aac")
-            and bool(names.intersection({"mov", "mp4", "m4a", "3gp", "3g2", "mj2"})))
-
-
-def prepare_native_media_item(item: dict, source: Path) -> dict:
-    if item.get("profile") != NATIVE_MEDIA_PROFILE or browser_native_media(source, item["extension"], item["reader_mode"]):
-        return item
-    result = dict(item)
-    if item["reader_mode"] == "audio":
-        result.update(profile="ffmpeg-audio-mp3-v1", output_name="audio.mp3", transcode_media=True)
-    else:
-        result.update(profile="ffmpeg-video-mp4-h264-aac-v1", output_name="video.mp4", transcode_media=True)
-    return result
 
 
 def embedded_pdf_fonts(path: Path) -> list[str]:
@@ -1026,7 +1057,6 @@ def convert_chm(source: Path, target: Path, work: Path) -> None:
         sanitize_chm_epub(target, work)
         if target.exists():
             repair_conversion(source, target, work)
-            repair_chm_epub_images(source, target, work)
         validate_output(target, "epub")
         validate_chm_epub(target)
         return
@@ -1054,8 +1084,6 @@ def convert_chm(source: Path, target: Path, work: Path) -> None:
             except ImportError:
                 from recover_chm import recover
             recover(source, target, source.stem)
-        if target.exists():
-            repair_chm_epub_images(source, target, work)
     validate_output(target, "epub")
     validate_chm_epub(target)
 
@@ -1467,19 +1495,23 @@ def convert_spreadsheet_to_pages(source: Path, target: Path, work: Path, item: d
     if not html_pages:
         raise RuntimeError("LibreOffice produced no spreadsheet worksheet HTML")
 
-    expected_sheets, expected_values, expected_charts, expected_images = spreadsheet_source_inventory(source)
+    expected_sheets, expected_values, expected_charts, expected_images = spreadsheet_source_inventory(
+        source, item.get("extension", source.suffix.lower().lstrip(".")),
+    )
 
     if len(html_pages) < len(expected_sheets):
         raise RuntimeError("spreadsheet HTML export omitted worksheet pages")
+    if len(expected_values) >= 50_000 and expected_charts == 0 and expected_images == 0:
+        html_pages = split_spreadsheet_html_rows(html_pages, work / "spreadsheet-html-chunks")
     exported_html = "\n".join(page.read_text(encoding="utf-8", errors="replace") for page in html_pages)
     visible_html = spreadsheet_text_key(extract_html_text(exported_html))
     missing_values = [value for value in expected_values
-                      if not any(spreadsheet_text_key(candidate) in visible_html
-                                 for candidate in spreadsheet_text_variants(value))]
+                      if not spreadsheet_text_present(value, visible_html)]
     if missing_values:
-        samples = [value[:160] for value in missing_values[:5]]
+        diagnostics = [len(spreadsheet_text_key(value)) for value in missing_values[:8]]
         raise RuntimeError(
-            f"spreadsheet HTML export omitted {len(missing_values)} non-empty cell value(s): {samples!r}"
+            f"spreadsheet HTML export omitted {len(missing_values)} non-empty cell value(s); "
+            f"normalized cell lengths: {diagnostics!r}"
         )
     exported_images = sum(len(image_sources(page.read_text(encoding="utf-8", errors="replace")))
                           for page in html_pages)
@@ -1502,6 +1534,78 @@ def convert_spreadsheet_to_pages(source: Path, target: Path, work: Path, item: d
         "version": 2, "kind": "pdf-pages", "source_sha256": source_sha256,
         "profile": item["profile"], "page_count": page_count,
     }, pretty=True))
+
+
+def convert_spreadsheet_to_html(source: Path, target: Path, work: Path, item: dict) -> None:
+    """Publish each worksheet as selectable HTML, embedding its local chart assets."""
+    output = work / "spreadsheet-html"
+    output.mkdir()
+    helper = Path(__file__).with_name("render_spreadsheet_html.py")
+    run_checked([
+        "/usr/bin/python3", str(helper), str(source), str(output),
+    ], timeout_seconds=SPREADSHEET_RENDER_COMMAND_TIMEOUT_SECONDS)
+    html_pages = sorted(output.glob("sheet-*/sheet.html"))
+    if not html_pages:
+        raise RuntimeError("LibreOffice produced no spreadsheet worksheet HTML")
+
+    expected_sheets, expected_values, expected_charts, expected_images = spreadsheet_source_inventory(
+        source, item.get("extension", source.suffix.lower().lstrip(".")),
+    )
+    if len(html_pages) < len(expected_sheets):
+        raise RuntimeError("spreadsheet HTML export omitted worksheet pages")
+    if len(expected_values) >= 50_000 and expected_charts == 0 and expected_images == 0:
+        html_pages = split_spreadsheet_html_rows(html_pages, work / "spreadsheet-html-chunks")
+
+    exported_html = "\n".join(page.read_text(encoding="utf-8", errors="replace") for page in html_pages)
+    visible_html = spreadsheet_text_key(extract_html_text(exported_html))
+    missing_values = [value for value in expected_values
+                      if not spreadsheet_text_present(value, visible_html)]
+    if missing_values:
+        diagnostics = [len(spreadsheet_text_key(value)) for value in missing_values[:8]]
+        raise RuntimeError(
+            f"spreadsheet HTML export omitted {len(missing_values)} non-empty cell value(s); "
+            f"normalized cell lengths: {diagnostics!r}"
+        )
+    exported_images = sum(len(image_sources(page.read_text(encoding="utf-8", errors="replace")))
+                          for page in html_pages)
+    if exported_images < expected_charts + expected_images:
+        raise RuntimeError("spreadsheet HTML export omitted chart or image objects")
+
+    styles = []
+    sections = []
+    for index, page_path in enumerate(html_pages, 1):
+        inlined = inline_local_html_resources(
+            page_path.read_text(encoding="utf-8", errors="replace"), output, page_path.parent,
+        )
+        document = lxml_html.document_fromstring(inlined)
+        for style in document.xpath("//head/style"):
+            if style.text:
+                styles.append(style.text)
+        body = document.find("body")
+        if body is None:
+            raise RuntimeError(f"spreadsheet worksheet {index} has no HTML body")
+        contents = (body.text or "") + "".join(
+            lxml_html.tostring(child, encoding="unicode", method="html") for child in body
+        )
+        match = re.match(r"sheet-([0-9]+)", page_path.stem)
+        sheet_index = int(match.group(1)) - 1 if match else index - 1
+        title = expected_sheets[sheet_index] if sheet_index < len(expected_sheets) else f"Sheet {index}"
+        sections.append(
+            f'<section class="reader-spreadsheet-sheet"><h2>{html.escape(title)}</h2>{contents}</section>'
+        )
+    target.write_text(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><style>"
+        "html,body{min-height:100%;margin:0;background:#fff;color:#16191c}"
+        "body{box-sizing:border-box;width:max-content;min-width:100%;padding:12px;"
+        "font:14px/1.35 Arial,'Noto Sans',sans-serif}"
+        ".reader-spreadsheet-sheet{width:max-content;min-width:100%;margin:0 0 24px}"
+        ".reader-spreadsheet-sheet h2{position:sticky;left:0;width:max-content;"
+        "margin:0 0 8px;font-size:16px}"
+        ".reader-spreadsheet-sheet img,.reader-spreadsheet-sheet svg{max-width:none;height:auto}"
+        f"</style><style>{' '.join(styles)}</style></head><body>"
+        + "".join(sections) + "</body></html>",
+        encoding="utf-8",
+    )
 
 
 def render_spreadsheet_html(html_pages: list[Path], output: Path) -> list[Path]:
@@ -1530,20 +1634,113 @@ def render_spreadsheet_html(html_pages: list[Path], output: Path) -> list[Path]:
                 })""")
                 if dimensions["width"] < 2 or dimensions["height"] < 2:
                     raise RuntimeError(f"spreadsheet worksheet {sheet_number} rendered blank")
-                page.set_viewport_size({"width": dimensions["width"], "height": 1600})
+                width, height = dimensions["width"], dimensions["height"]
+                if (width <= SPREADSHEET_FULL_PAGE_MAX_EDGE
+                        and height <= SPREADSHEET_FULL_PAGE_MAX_EDGE
+                        and width * height <= SPREADSHEET_FULL_PAGE_MAX_PIXELS):
+                    page.set_viewport_size({"width": width, "height": min(height, 1600)})
+                    page.wait_for_timeout(80)
+                    target = output / f"sheet-{sheet_number:04d}.png"
+                    page.screenshot(path=str(target), full_page=True)
+                    screenshots.append(target)
+                    continue
+
+                tile_width, tile_height = min(width, 1800), min(height, 1600)
+                page.set_viewport_size({"width": tile_width, "height": tile_height})
                 page.wait_for_timeout(80)
-                target = output / f"sheet-{sheet_number:04d}.png"
-                page.screenshot(path=str(target), full_page=True)
-                screenshots.append(target)
+                dimensions = page.evaluate("""() => ({
+                  width: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth),
+                  height: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight)
+                })""")
+                columns = max(1, (max(0, dimensions["width"] - tile_width) + 1759) // 1760 + 1)
+                rows = max(1, (max(0, dimensions["height"] - tile_height) + 1559) // 1560 + 1)
+                for row in range(rows):
+                    for column in range(columns):
+                        page.evaluate("""({x, y}) => window.scrollTo(x, y)""", {
+                            "x": column * 1760, "y": row * 1560,
+                        })
+                        page.wait_for_timeout(80)
+                        target = output / f"sheet-{sheet_number:04d}-tile-{row:04d}-{column:04d}.png"
+                        page.screenshot(path=str(target))
+                        screenshots.append(target)
             return screenshots
         finally:
             browser.close()
 
 
-def spreadsheet_source_inventory(source: Path) -> tuple[list[str], list[str], int, int]:
+def split_spreadsheet_html_rows(html_pages: list[Path], output: Path,
+                                rows_per_chunk: int = 50) -> list[Path]:
+    output.mkdir(parents=True, exist_ok=True)
+    result = []
+    for sheet_number, source in enumerate(html_pages, 1):
+        document = lxml_html.parse(str(source))
+        tables = document.xpath("//table")
+        if not tables:
+            result.append(source)
+            continue
+        table = max(tables, key=lambda candidate: len(candidate.xpath(".//tr")))
+        rows = table.xpath(".//tr")
+        if len(rows) <= rows_per_chunk:
+            result.append(source)
+            continue
+        table_path = document.getpath(table)
+        for chunk_number, start in enumerate(range(0, len(rows), rows_per_chunk), 1):
+            end = min(len(rows), start + rows_per_chunk)
+            chunk = copy.deepcopy(document)
+            chunk_table = chunk.xpath(table_path)[0]
+            chunk_rows = chunk_table.xpath(".//tr")
+            for index in range(len(chunk_rows) - 1, -1, -1):
+                if not start <= index < end:
+                    parent = chunk_rows[index].getparent()
+                    if parent is not None:
+                        parent.remove(chunk_rows[index])
+            target = output / f"sheet-{sheet_number:04d}-chunk-{chunk_number:04d}.html"
+            target.write_bytes(lxml_html.tostring(
+                chunk, encoding="utf-8", method="html", doctype="<!DOCTYPE html>"))
+            result.append(target)
+    return result
+
+
+def spreadsheet_source_inventory(source: Path, extension: str = "") -> tuple[list[str], list[str], int, int]:
+    extension = (extension or source.suffix.lower().lstrip(".")).lower().lstrip(".")
+    if extension == "csv":
+        raw = source.read_bytes()
+        text = None
+        for encoding in ("utf-8-sig", "gb18030", "cp1252"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            raise RuntimeError("spreadsheet CSV text encoding is unreadable")
+        sample = text[:8192]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        values = [cell.strip() for row in csv.reader(io.StringIO(text, newline=""), dialect)
+                  for cell in row if cell.strip()]
+        return ["Sheet1"], list(dict.fromkeys(values)), 0, 0
     try:
         with zipfile.ZipFile(source) as archive:
             names = set(archive.namelist())
+            if "content.xml" in names and extension == "ods":
+                content = ET.fromstring(archive.read("content.xml"))
+                tables = content.findall(".//{*}table")
+                sheets = [next((value for key, value in table.attrib.items()
+                                if key.endswith("}name")), "") for table in tables]
+                values = []
+                for table in tables:
+                    for cell in table.findall(".//{*}table-cell"):
+                        text = "".join(node.text or "" for node in cell.findall(".//{*}p"))
+                        if text.strip():
+                            values.append(text.strip())
+                charts = sum(name.startswith("Object ") and name.endswith("/content.xml")
+                             for name in names)
+                images = sum(name.startswith("Pictures/") and not name.endswith("/")
+                             for name in names)
+                return sheets, list(dict.fromkeys(values)), charts, images
             workbook = ET.fromstring(archive.read("xl/workbook.xml"))
             relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
             targets = {node.attrib.get("Id"): node.attrib.get("Target", "")
@@ -1596,7 +1793,7 @@ def spreadsheet_source_inventory(source: Path) -> tuple[list[str], list[str], in
                             values.append(text.strip())
             charts = sum(name.startswith("xl/charts/chart") and name.endswith(".xml") for name in names)
             images = sum(name.startswith("xl/media/") and not name.endswith("/") for name in names)
-            return sheets, values, charts, images
+            return sheets, list(dict.fromkeys(values)), charts, images
     except (zipfile.BadZipFile, KeyError, ET.ParseError):
         try:
             import xlrd
@@ -1620,7 +1817,7 @@ def spreadsheet_source_inventory(source: Path) -> tuple[list[str], list[str], in
                             values.append(value.strip())
         finally:
             legacy.release_resources()
-        return sheets, values, 0, 0
+        return sheets, list(dict.fromkeys(values)), 0, 0
 
 
 def spreadsheet_text_variants(value: str) -> set[str]:
@@ -1636,6 +1833,38 @@ def spreadsheet_text_variants(value: str) -> set[str]:
 def spreadsheet_text_key(value: str) -> str:
     """Ignore layout whitespace inserted or normalized by HTML export."""
     return re.sub(r"\s+", "", value)
+
+
+def spreadsheet_text_present(value: str, rendered_text: str) -> bool:
+    for candidate in spreadsheet_text_variants(value):
+        key = spreadsheet_text_key(candidate)
+        if not key or key in rendered_text:
+            return True
+        position = 0
+        matched = True
+        for offset in range(0, len(key), 24):
+            chunk = key[offset:offset + 24]
+            found = rendered_text.find(chunk, position)
+            if found >= 0:
+                position = found + len(chunk)
+                continue
+            window_end = min(len(rendered_text), position + len(chunk) * 8 + 512)
+            window = rendered_text[position:window_end]
+            for char in chunk:
+                char_position = window.find(char)
+                if char_position < 0:
+                    matched = False
+                    break
+                window = window[char_position + 1:]
+            if not matched:
+                break
+            position = window_end - len(window)
+        if matched:
+            return True
+        chunks = [key[offset:offset + 16] for offset in range(0, len(key), 16)]
+        if all(chunk in rendered_text for chunk in chunks):
+            return True
+    return False
 
 
 class _ImageSources(HTMLParser):
@@ -1694,7 +1923,7 @@ def validate_mhtml_content(path: Path) -> None:
 def validate_reader_content(path: Path, item: dict, work: Path) -> None:
     mode = item["reader_mode"]
     if mode == "pdf":
-        if item.get("output_name") == "page-manifest.json":
+        if item.get("profile") == SPREADSHEET_HTML_PROFILE:
             validate_page_manifest(path)
         else:
             validate_pdf_content(path, work)
@@ -1711,24 +1940,53 @@ def validate_reader_content(path: Path, item: dict, work: Path) -> None:
         raise RuntimeError("original Foliate asset is empty")
 
 
+def convert_reader_image(source: Path, target: Path) -> None:
+    with READER_IMAGE_LOCK:
+        max_pixels = Image.MAX_IMAGE_PIXELS
+        try:
+            Image.MAX_IMAGE_PIXELS = MAX_READER_IMAGE_PIXELS
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(source) as image:
+                    # Some PSDs expose a broken layer sequence even though
+                    # their first composite frame is readable.
+                    try:
+                        image.seek(0)
+                    except EOFError:
+                        pass
+                    image.thumbnail(
+                        (MAX_READER_IMAGE_EDGE, MAX_READER_IMAGE_EDGE), Image.Resampling.LANCZOS,
+                    )
+                    image.convert("RGB").save(target, "WEBP", method=6, quality=88)
+        finally:
+            Image.MAX_IMAGE_PIXELS = max_pixels
+
+
 def convert_file(item: dict, source: Path, target: Path, work: Path,
                  source_sha256: str = "", object_path: str = "") -> None:
     ext = item["extension"]
-    if item.get("profile") == NATIVE_MEDIA_PROFILE or item.get("reader_mode") == "swf":
+    if item.get("profile") == NATIVE_MEDIA_PROFILE:
+        shutil.copyfile(source, target)
+        return
+    if item.get("reader_mode") == "swf":
         shutil.copyfile(source, target)
         return
     if item.get("transcode_media"):
         if item["reader_mode"] == "audio":
-            run_checked(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
-                         "-map", "0:a:0", "-vn", "-sn", "-dn", "-map_metadata", "-1",
-                         "-c:a", "libmp3lame", "-q:a", "3", str(target)], timeout_seconds=MEDIA_COMMAND_TIMEOUT_SECONDS)
+            run_checked([
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(source), "-map", "0:a:0", "-vn", "-sn", "-dn",
+                "-map_metadata", "-1", "-c:a", "libmp3lame", "-q:a", "3", str(target),
+            ], timeout_seconds=MEDIA_COMMAND_TIMEOUT_SECONDS)
         else:
-            run_checked(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
-                         "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-map_metadata", "-1",
-                         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                         "-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-                         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(target)],
-                        timeout_seconds=MEDIA_COMMAND_TIMEOUT_SECONDS)
+            run_checked([
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+                "-map_metadata", "-1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", str(target),
+            ], timeout_seconds=MEDIA_COMMAND_TIMEOUT_SECONDS)
         return
     office_profile = (work / "libreoffice-profile").resolve().as_uri()
     explicit_password = item.get("source_password") or source_password(item.get("repo", ""), item.get("path", ""))
@@ -1815,15 +2073,13 @@ def convert_file(item: dict, source: Path, target: Path, work: Path,
                 shutil.move(produced, target)
             else:
                 raise
-    elif ext in {"txt", "md", "markdown"}:
+    elif ext in {"txt", "md", "markdown", "vcf", "ini"}:
         shutil.copyfile(source, target)
-    elif ext in {"jpg", "jpeg", "png", "gif", "bmp", "webp"}:
+    elif ext in {"jpg", "jpeg", "png", "gif", "bmp", "webp", "psd"}:
         # Keep the source repository untouched, but serve one CDN-friendly
         # image format from the shared Reader bucket.
         if item.get("reader_mode") == "image" and item.get("output_name", "").endswith(".webp"):
-            image = Image.open(source)
-            image.seek(0)
-            image.convert("RGB").save(target, "WEBP", method=6, quality=88)
+            convert_reader_image(source, target)
         else:
             shutil.copyfile(source, target)
     elif ext == "pdf" and item.get("profile") == "native-pdf-v1":
@@ -1871,7 +2127,7 @@ def convert_file(item: dict, source: Path, target: Path, work: Path,
                     raise
                 time.sleep(2)
     elif ext in {"ppt", "pptx", "pps", "odp", "xls", "xlsx", "csv", "ods", "wps"}:
-        if item.get("output_name") == "page-manifest.json":
+        if item.get("profile") == SPREADSHEET_HTML_PROFILE:
             spreadsheet_source = source
             if ext == "xlsx" and source.read_bytes()[:8] == OLE_SIGNATURE:
                 spreadsheet_source = work / "spreadsheet-source.xls"
@@ -1882,9 +2138,7 @@ def convert_file(item: dict, source: Path, target: Path, work: Path,
                 if is_ooxml_workbook:
                     spreadsheet_source = work / "spreadsheet-source.xlsx"
                     shutil.copyfile(source, spreadsheet_source)
-            convert_spreadsheet_to_pages(
-                spreadsheet_source, target, work, item, source_sha256, object_path,
-            )
+            convert_spreadsheet_to_html(spreadsheet_source, target, work, item)
             return
         out = work / "office-pdf"
         out.mkdir()
@@ -1892,6 +2146,12 @@ def convert_file(item: dict, source: Path, target: Path, work: Path,
         if ext == "xlsx" and source.read_bytes()[:8] == OLE_SIGNATURE:
             office_source = work / "source.xls"
             shutil.copyfile(source, office_source)
+        elif ext == "xls" and zipfile.is_zipfile(source):
+            with zipfile.ZipFile(source) as workbook:
+                is_ooxml_workbook = "xl/workbook.xml" in workbook.namelist()
+            if is_ooxml_workbook:
+                office_source = work / "source.xlsx"
+                shutil.copyfile(source, office_source)
         run_checked([
             "libreoffice", "--headless", f"-env:UserInstallation={office_profile}",
             "--convert-to", "pdf", "--outdir", str(out), str(office_source),
@@ -1914,7 +2174,7 @@ def convert_file(item: dict, source: Path, target: Path, work: Path,
         run_checked([
             "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(source), "-map", "0:a:0", "-vn", "-sn", "-dn",
-            "-map_metadata", "-1", "-c:a", "libmp3lame", "-q:a", "3", "-f", "mp3", str(target),
+            "-map_metadata", "-1", "-c:a", "libmp3lame", "-q:a", "3", str(target),
         ], timeout_seconds=MEDIA_COMMAND_TIMEOUT_SECONDS)
     elif ext in {"asx", "flv", "f4v", "rm", "rmvb", "mkv", "avi", "mpg", "mpeg", "mts", "ts", "wmv", "mov", "mp4"}:
         if ext in {"asx", "rm", "rmvb"} and item.get("source_media_mode") == "audio":
@@ -2098,8 +2358,20 @@ def convert_item(item: dict, bundle: Path, reusable: dict | None = None) -> dict
         with artifact_lock(target):
             if not target.exists():
                 if existing:
-                    asset_url = f"https://huggingface.co/datasets/{READER_ASSETS_REPO}/resolve/main/{existing['path']}"
-                    download_existing(asset_url, target, existing["sha256"])
+                    try:
+                        asset_url = f"https://huggingface.co/datasets/{READER_ASSETS_REPO}/resolve/main/{existing['path']}"
+                        download_existing(asset_url, target, existing["sha256"])
+                    except Exception as error:
+                        if not is_remote_not_found(error):
+                            raise
+                        # The manifest can outlive the dataset object. Rebuild at
+                        # the same content-addressed path from the source instead
+                        # of publishing another broken mapping.
+                        print(f"reusable Reader object missing; rebuilding "
+                              f"{item.get('repo', '')}/{item.get('path', item['key'])}")
+                        existing = None
+                        reused = False
+                if existing:
                     if target.stat().st_size != existing["bytes"]:
                         raise RuntimeError("reusable reader artifact size mismatch")
                     if item.get("output_name") == "page-manifest.json":
