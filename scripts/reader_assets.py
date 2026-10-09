@@ -11,7 +11,7 @@ from pathlib import Path
 MANIFEST_VERSION = 1
 CHAPTER_MANIFEST_VERSION = 1
 READER_ASSETS_REPO = "vomebook/Reader-Assets"
-READER_ASSETS_BUCKET = "vomebook/pdf-pages"
+READER_ASSETS_BUCKET = "vomebook/reader-assets-v2"
 MANIFEST_NAME = "manifest.json"
 # Chapter manifests make multi-file books cheap to open: the Reader fetches the
 # manifest and nearby chapters instead of downloading the complete archive.
@@ -275,7 +275,7 @@ def bucket_conversion_contract(repo: str, path: str, extension: str, source_byte
     if extension in {"xls", "xlsx", "csv", "ods"}:
         return (SPREADSHEET_HTML_PROFILE, "html", "document.html")
     contract = source_conversion_contract(repo, path, extension, source_bytes)
-    if contract and contract[1] in {"docx", "html", "text", "markdown", "image", "pdf", "foliate", "epub", "swf"}:
+    if contract and contract[1] in {"docx", "html", "text", "markdown", "image", "pdf", "foliate", "epub", "swf", "audio", "video"}:
         return contract
     return None
 
@@ -312,7 +312,7 @@ def validate_manifest(manifest: dict) -> dict:
                 validate_chapter_manifest_path(entry["chapter_manifest"])
             if "fallback_path" in entry:
                 validate_object_path(entry["fallback_path"])
-            if entry.get("chapter_bucket") not in {None, "vomebook/pdf-pages"}:
+            if entry.get("chapter_bucket") not in {None, READER_ASSETS_BUCKET}:
                 raise ValueError("invalid chapter bucket")
             if "chapter_manifest" in entry and not entry["chapter_manifest"].endswith("/chapter-manifest.json"):
                 raise ValueError("invalid chapter manifest path")
